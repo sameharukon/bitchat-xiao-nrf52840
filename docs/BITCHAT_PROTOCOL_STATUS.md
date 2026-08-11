@@ -10,12 +10,18 @@ version 1 `ANNOUNCE`, derive its sender ID from the Noise public key, and verify
 its Ed25519 signature. Valid sender-ID and signature results have both been
 observed on the XIAO hardware.
 
-The firmware now also generates an ephemeral local X25519/Ed25519 identity,
-encodes and signs a local version 1 `ANNOUNCE`, and writes it to the remote
-Bitchat characteristic. The official iPhone app accepted the live outbound
-announcement and displayed the XIAO as `xiao52840`. Persistent keys, the BLE
-peripheral role, the Noise XX handshake, and message exchange have not been
-implemented yet.
+The firmware also maintains a local X25519/Ed25519 identity, encodes and signs
+a local version 1 `ANNOUNCE`, and writes it to the remote Bitchat
+characteristic. The official iPhone app accepted the live outbound
+announcement and displayed the XIAO as `xiao52840`. Versioned identity-seed
+storage in internal LittleFS is implemented, but persistence across a hardware
+reboot still requires an on-device test. The iPhone subsequently advertised
+the XIAO sender ID as a direct neighbor and sent a directed, signed
+`REQUEST_SYNC`. Request decoding, authentication, GCS membership checking, and
+the no-response path for a present GCS member have been verified on-device. A
+one-shot forced-missing test also verified the queued TTL-zero RSR announcement
+response through a successful 168-byte GATT write. The BLE peripheral role,
+the Noise XX handshake, and message exchange have not been implemented yet.
 
 ## Current Data Flow
 
@@ -34,6 +40,10 @@ flowchart LR
     J -->|signature and sender ID valid| K[Epoch clock sync]
     K --> L[Build and sign local ANNOUNCE]
     L --> M[GATT write to Bitchat peer]
+    N[Persistent local identity seeds] --> L
+    E --> O[Directed REQUEST_SYNC]
+    O --> P[Peer signature and GCS validation]
+    P --> Q[Queued TTL 0 RSR ANNOUNCE response]
 ```
 
 The implementation uses static buffers and does not allocate packet storage on
@@ -236,7 +246,17 @@ Total:           168 bytes
 | 8 | `privateMedia` | Yes |
 | 9 | `privateMediaReceipts` | Yes |
 
-No direct-neighbor or bridge-geohash TLV was present in the observed packet.
+A later 92-byte announcement payload included one direct-neighbor TLV:
+
+```text
+Direct neighbors: 1
+  - 25-07-EA-E2-F0-1F-E8-40
+```
+
+This value is the XIAO sender ID used by the accepted `xiao52840`
+announcement. The live iPhone peer therefore progressed from displaying the
+XIAO to including it in its advertised neighbor table. No bridge-geohash TLV
+was present.
 
 ## Peer Identity Check
 
@@ -333,10 +353,11 @@ The local announcement uses the following values:
 | Wire packet size | 168 bytes |
 | Canonical signing data | 256 bytes |
 
-At startup, CryptoCell generates independent random seeds for an X25519 key
-pair and an Ed25519 key pair. The keys are held in RAM and are regenerated on
-every boot. This is intentional for the first transmission test, but it means
-the XIAO has a different peer identity after every restart.
+On the first successful startup, CryptoCell generates independent random seeds
+for an X25519 key pair and an Ed25519 key pair. The firmware writes those seeds
+to internal LittleFS and derives the runtime key pairs from them. On subsequent
+starts, the same seeds are loaded and the same sender ID and public keys should
+be derived.
 
 The board has no trusted wall clock. It accepts a timestamp as a clock source
 only after the incoming announcement has both a valid sender-ID fingerprint and
@@ -347,7 +368,9 @@ link remains active.
 Expected transmission log:
 
 ```text
-Local Bitchat identity: READY (ephemeral)
+Identity filesystem: READY
+Local identity storage: CREATED
+Local Bitchat identity: READY (persistent)
 Local nickname: xiao52840
 Local Sender ID: ...
 ...
@@ -357,9 +380,132 @@ Packet length: 168
 GATT write: OK (168 bytes)
 ```
 
+After a restart, `Local identity storage: LOADED` should replace `CREATED`, and
+the sender ID and both public keys should be unchanged.
+
 The firmware prefers write without response, matching the current upstream BLE
 sender, and falls back to a write with response when required by the discovered
 characteristic.
+
+## Local Identity Persistence
+
+The identity record has a fixed, explicitly serialized 104-byte format. It
+does not depend on C structure layout or padding.
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 4 | Magic bytes `BCID` |
+| 4 | 1 | Record version, currently `1` |
+| 5 | 3 | Reserved, must be zero |
+| 8 | 32 | X25519 seed |
+| 40 | 32 | Ed25519 seed |
+| 72 | 32 | SHA-256 over bytes 0 through 71 |
+
+Creation uses `/bitchat_identity.tmp` first. The firmware flushes and closes
+the temporary file, reads it back, validates its size and SHA-256 digest, and
+checks that both seeds match before renaming it to
+`/bitchat_identity.bin`. A complete temporary record left by power loss is
+recovered on the next start.
+
+An invalid primary record causes local identity initialization to fail closed;
+the firmware does not silently replace it with a different peer identity. The
+receive and decode path can still operate, but no local announcement is sent.
+
+The SHA-256 field detects accidental corruption only. It is neither encryption
+nor authentication. Both seeds are stored in plaintext internal flash and must
+be treated as private key material. The current Seeed `InternalFS.begin()`
+implementation formats the LittleFS area after a mount failure, so severe
+filesystem damage can still erase the record and cause a new identity to be
+created. Hardware-backed key protection and recovery policy remain future
+work.
+
+## Request Sync
+
+`REQUEST_SYNC` is a directed, signed, link-local packet. Its TTL must be zero.
+The payload uses a one-byte type and a two-byte big-endian length, unlike the
+one-byte lengths used by announcement TLVs.
+
+| Type | Field | Encoding |
+| ---: | --- | --- |
+| `0x01` | Golomb-Rice parameter P | One byte, accepted range 1 through 32 |
+| `0x02` | Hash range M | Four-byte big-endian integer |
+| `0x03` | GCS data | Up to 1024 opaque bytes, MSB-first bitstream |
+| `0x04` | Requested message types | One to eight little-endian bitfield bytes |
+| `0x05` | Coverage cursor | Eight-byte big-endian timestamp |
+| `0x06` | Fragment stream filter | UTF-8 comma-separated fragment IDs |
+
+The live iPhone request was 115 bytes in total and was directed to the XIAO:
+
+```text
+TTL:          0
+Flags:        0x03 [recipient, signature]
+Payload:      21 bytes
+Sender ID:    29-6F-2F-21-F2-88-95-43
+Recipient ID: 25-07-EA-E2-F0-1F-E8-40
+P:            7
+M:            256
+GCS data:     4E-58
+Types bytes:  03-04
+Types value:  0x0403 [announce, message, groupMessage]
+```
+
+The firmware now retains the signing key only from a sender-ID-checked and
+signature-verified announcement on the active link. A sync request is accepted
+only when all of the following are true:
+
+1. TTL is zero.
+2. The recipient ID equals the local sender ID.
+3. The sender has a verified announcement cached for the active connection.
+4. The request signature verifies with that cached Ed25519 key.
+5. The required P, M, and GCS-data TLVs are structurally valid.
+
+For an announcement request, the firmware computes the official 16-byte packet
+ID as the SHA-256 prefix over `type | sender ID | timestamp | payload`. It maps
+that ID into the requested GCS range and decodes the Golomb-Rice bitstream. If
+the latest transmitted local announcement is absent, a response is queued for
+the Arduino loop instead of writing GATT from the BLE callback.
+
+The response reuses the exact cached announcement, sets TTL to zero, and sets
+the RSR flag `0x10`. TTL and RSR are excluded from canonical signing data, so
+the existing signature remains valid. Responses are limited to eight per
+30-second window.
+
+The complete receive-side path has now been observed on the XIAO with a second
+live request:
+
+```text
+Recipient verification: VALID
+Signature verification: VALID (signed data: 256 bytes)
+P: 7
+M: 768
+GCS data [7 bytes]: AA-8D-B7-0D-AA-60-60
+Types raw: 0x07A3
+REQUEST_SYNC fields: VALID
+Local ANNOUNCE packet ID: 45-CF-B9-52-9C-4E-49-9A-71-9D-9B-0D-13-57-C4-10
+GCS membership: PRESENT
+REQUEST_SYNC response: not needed
+```
+
+This verifies the local-recipient check, cached-peer-key lookup, Ed25519
+verification, TLV decoding, packet-ID calculation, GCS decoding, and the
+correct suppression of a redundant response.
+
+The transmission branch was then exercised with a compile-time, one-shot
+forced-missing hook applied only after all request authentication and parsing
+had succeeded:
+
+```text
+GCS membership: FORCED MISSING (one-shot test)
+REQUEST_SYNC response: RSR ANNOUNCE QUEUED
+
+=== REQUEST_SYNC ANNOUNCE RESPONSE TX ===
+TTL: 0
+Flags: 0x12 [signature, RSR]
+GATT write: OK (168 bytes)
+```
+
+The test flag was returned to zero after this result. Normal builds therefore
+use the actual GCS membership result.
 
 ## Implementation Status
 
@@ -380,12 +526,19 @@ characteristic.
 | Signature extraction | Complete | Correct 64-byte location after payload |
 | Ed25519 verification | Complete | `VALID` observed on the XIAO with a live announcement |
 | Compressed payload decoding | Not implemented | Parser logs and skips compressed payloads |
-| Peer registry | Not implemented | No persistent verified-peer state |
-| Local X25519 identity | Implemented | Ephemeral; regenerated on every boot |
-| Local Ed25519 identity | Implemented | Ephemeral; private key retained for signing |
+| Active-link verified peer cache | Implemented | One sender ID and Ed25519 key; cleared on disconnect |
+| Persistent peer registry | Not implemented | No durable verified-peer or Noise-authenticated state |
+| Local identity persistence | Implemented; hardware test pending | Versioned 104-byte LittleFS seed record |
+| Local X25519 identity | Implemented | Derived from the stored 32-byte seed |
+| Local Ed25519 identity | Implemented | Derived from the stored seed; secret key retained in RAM for signing |
 | ANNOUNCE encoding and signing | Implemented | 168-byte wire packet; 256-byte signing representation |
 | ANNOUNCE GATT transmission | Complete | Live 168-byte transmission reached the iPhone app |
 | Official-app peer display | Complete | `xiao52840` observed in the iPhone app |
+| Official-app neighbor registration | Complete | iPhone ANNOUNCE listed the XIAO sender ID as a direct neighbor |
+| REQUEST_SYNC TLV decoding | Complete | Live requests with 21-byte and 26-byte payloads decoded on-device |
+| REQUEST_SYNC authentication | Complete | Local recipient and Ed25519 signature both reported `VALID` on-device |
+| REQUEST_SYNC GCS membership | Complete for present-member path | Packet ID calculated and `PRESENT` observed on-device |
+| REQUEST_SYNC RSR response | Complete | TTL 0, flag `0x12`, and 168-byte GATT write observed on-device |
 | BLE peripheral role | Not implemented | Not required for the first central-role transmission test |
 | Noise XX handshake | Not implemented | Required for authenticated private communication |
 | Message transmission | Not implemented | Depends on peer presence and Noise work |
@@ -400,6 +553,7 @@ MAX_FRAGMENT_DATA  = 480
 MAX_REASSEMBLED    = 8192
 MAX_SIGNING_DATA   = 2048
 MAX_ANNOUNCE_PACKET = 256
+MAX_REQUEST_SYNC_GCS = 1024
 ```
 
 The current fragment storage reserves approximately 7.7 KiB, and the signing
@@ -427,6 +581,21 @@ Arduino loop. Lock acquisition has a one-second timeout and fails closed.
   self-check before transmission.
 - The official iPhone app received the local announcement and displayed
   `xiao52840` as a peer.
+- A later iPhone announcement listed the XIAO sender ID in its direct-neighbor
+  TLV.
+- The iPhone sent a signed `REQUEST_SYNC` directly to the XIAO sender ID. Its
+  21-byte payload decodes consistently as P 7, M 256, GCS `4E-58`, and
+  announcement/message/group-message type flags.
+- A later 26-byte request passed local-recipient and Ed25519 verification,
+  decoded as P 7 and M 768, calculated the local announcement packet ID, and
+  correctly suppressed its response after reporting GCS `PRESENT`.
+- A one-shot forced-missing test queued an RSR announcement and completed a
+  168-byte GATT write with TTL 0 and flags `0x12`. The test flag was then
+  disabled.
+- The persistent identity code passes an ARM C++11 object compile, including
+  the installed LittleFS and internal-filesystem headers.
+- First-boot creation and reboot loading of the identity record have not yet
+  been confirmed on the XIAO hardware.
 - The source passes `git diff --check`.
 - The sketch passes a C++11 syntax check with the XIAO nRF52840 ARM compiler.
 - Object generation with the XIAO toolchain succeeded.
@@ -456,13 +625,16 @@ object checks.
 
 ### Transmit and Session Phase
 
-1. Persist the X25519 and Ed25519 keys so the local identity survives reboot.
-2. Enable the BLE peripheral role and expose the expected Bitchat GATT service
+1. Flash the persistence build, record the first-boot sender ID, restart the
+   board, and confirm `LOADED` plus an identical sender ID and public keys.
+2. Define an explicit identity reset and backup policy before relying on the
+   board as a long-lived peer.
+3. Enable the BLE peripheral role and expose the expected Bitchat GATT service
    for full dual-role mesh participation.
-3. Add outbound fragmentation for packet types that exceed the active link MTU.
-4. Implement the Noise XX handshake and bind the authenticated Noise identity to
+4. Add outbound fragmentation for packet types that exceed the active link MTU.
+5. Implement the Noise XX handshake and bind the authenticated Noise identity to
    the announced peer state.
-5. Implement encrypted message send and receive paths.
+6. Implement encrypted message send and receive paths.
 
 ## Upstream References
 

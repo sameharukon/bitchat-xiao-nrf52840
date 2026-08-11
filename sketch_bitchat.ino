@@ -1,17 +1,35 @@
 #include <bluefruit.h>
 #include <Adafruit_nRFCrypto.h>
+#include <Adafruit_LittleFS.h>
+#include <InternalFileSystem.h>
 #include <nrf_cc310/include/crys_ec_edw_api.h>
 #include <nrf_cc310/include/crys_ec_mont_api.h>
+
+using namespace Adafruit_LittleFS_Namespace;
 
 #define MAX_FRAGMENTS      16
 #define MAX_FRAGMENT_DATA  480
 #define MAX_REASSEMBLED    8192
 #define MAX_SIGNING_DATA   2048
 #define MAX_ANNOUNCE_PACKET 256
+#define MAX_REQUEST_SYNC_GCS 1024
+#define IDENTITY_RECORD_DATA_SIZE 72
+#define IDENTITY_RECORD_SIZE 104
+
+// Set to 0 after the one-shot RSR response path has been verified on hardware.
+#define FORCE_REQUEST_SYNC_MISSING_TEST 0
 
 static const char LOCAL_NICKNAME[] = "xiao52840";
 static const uint32_t ANNOUNCE_INTERVAL_MS = 20000;
 static const uint32_t ANNOUNCE_RETRY_MS = 1000;
+static const uint32_t REQUEST_SYNC_RESPONSE_WINDOW_MS = 30000;
+static const uint8_t REQUEST_SYNC_RESPONSE_LIMIT = 8;
+static const char IDENTITY_FILE_PATH[] = "/bitchat_identity.bin";
+static const char IDENTITY_TEMP_FILE_PATH[] = "/bitchat_identity.tmp";
+static const uint8_t IDENTITY_RECORD_MAGIC[4] = {
+  'B', 'C', 'I', 'D'
+};
+static const uint8_t IDENTITY_RECORD_VERSION = 1;
 
 struct LocalIdentity
 {
@@ -21,6 +39,25 @@ struct LocalIdentity
   uint8_t signingSecretKey[64];
   uint8_t signingPublicKey[32];
   uint8_t senderId[8];
+};
+
+struct VerifiedPeerIdentity
+{
+  bool ready;
+  uint8_t senderId[8];
+  uint8_t signingPublicKey[32];
+};
+
+struct RequestSyncPayload
+{
+  uint8_t p;
+  uint32_t m;
+  const uint8_t* gcsData;
+  uint16_t gcsLength;
+  uint64_t types;
+  bool hasTypes;
+  bool hasSinceTimestamp;
+  uint64_t sinceTimestamp;
 };
 
 struct FragmentAssembly
@@ -43,7 +80,9 @@ struct FragmentAssembly
 
 FragmentAssembly fragmentAssembly;
 LocalIdentity localIdentity;
+VerifiedPeerIdentity verifiedPeer;
 SemaphoreHandle_t cryptoMutex = NULL;
+SemaphoreHandle_t protocolStateMutex = NULL;
 
 // Bitchat Service UUID
 BLEClientService bitchatService(
@@ -66,12 +105,19 @@ static const uint8_t bitchatUuidLE[] = {
 
 bool connecting = false;
 bool cryptoReady = false;
+bool identityFileSystemReady = false;
 volatile bool bitchatLinkReady = false;
 volatile uint8_t bitchatCharacteristicProperties = 0;
 volatile bool localAnnouncePending = false;
 volatile bool localAnnounceSent = false;
 volatile uint32_t lastLocalAnnounceSentAt = 0;
 uint32_t lastLocalAnnounceAttemptAt = 0;
+volatile bool requestSyncResponsePending = false;
+uint32_t lastRequestSyncResponseAttemptAt = 0;
+uint32_t requestSyncResponseWindowStartedAt = 0;
+uint8_t requestSyncResponseCount = 0;
+uint8_t lastLocalAnnouncePacket[MAX_ANNOUNCE_PACKET];
+size_t lastLocalAnnouncePacketLength = 0;
 
 volatile uint32_t clockGeneration = 0;
 volatile uint32_t clockEpochHigh = 0;
@@ -158,6 +204,17 @@ void printHex(const uint8_t* data, size_t len)
     if (i + 1 < len) {
       Serial.print('-');
     }
+  }
+}
+
+void secureZero(void* data, size_t length)
+{
+  volatile uint8_t* bytes = static_cast<volatile uint8_t*>(data);
+
+  while (length > 0)
+  {
+    *bytes++ = 0;
+    length--;
   }
 }
 
@@ -276,7 +333,7 @@ size_t signingDataLengthWithPadding(size_t unpaddedLength)
   return unpaddedLength;
 }
 
-bool calculateSha256(uint8_t* data, size_t length, uint8_t* digest)
+bool calculateSha256(const uint8_t* data, size_t length, uint8_t* digest)
 {
   static nRFCrypto_Hash hash;
 
@@ -291,7 +348,8 @@ bool calculateSha256(uint8_t* data, size_t length, uint8_t* digest)
   bool success = false;
   if (
     hash.begin(CRYS_HASH_SHA256_mode) &&
-    hash.update(data, length)
+    // The nRFCrypto API does not mark the input as const but does not modify it.
+    hash.update(const_cast<uint8_t*>(data), length)
   )
   {
     success = hash.end(digest) == 32;
@@ -426,33 +484,174 @@ bool verifyNoiseKeySenderId(
   return matches;
 }
 
-bool initializeLocalIdentity()
+bool validateIdentityRecord(const uint8_t* record)
 {
-  memset(&localIdentity, 0, sizeof(localIdentity));
-
-  if (!cryptoReady)
-  {
-    return false;
-  }
-
-  static nRFCrypto_Random random;
-  uint8_t noiseSeed[32];
-  uint8_t signingSeed[32];
-  uint8_t digest[64];
-
   if (
-    !random.begin() ||
-    !random.generate(noiseSeed, sizeof(noiseSeed)) ||
-    !random.generate(signingSeed, sizeof(signingSeed))
+    memcmp(record, IDENTITY_RECORD_MAGIC, sizeof(IDENTITY_RECORD_MAGIC)) != 0 ||
+    record[4] != IDENTITY_RECORD_VERSION ||
+    record[5] != 0 ||
+    record[6] != 0 ||
+    record[7] != 0
   )
   {
-    random.end();
-    memset(noiseSeed, 0, sizeof(noiseSeed));
-    memset(signingSeed, 0, sizeof(signingSeed));
     return false;
   }
 
+  uint8_t digest[64];
+  bool hashCalculated = calculateSha256(
+    record,
+    IDENTITY_RECORD_DATA_SIZE,
+    digest
+  );
+  bool valid = hashCalculated && memcmp(
+    record + IDENTITY_RECORD_DATA_SIZE,
+    digest,
+    32
+  ) == 0;
+
+  secureZero(digest, sizeof(digest));
+  return valid;
+}
+
+bool readIdentitySeeds(
+  const char* path,
+  uint8_t* noiseSeed,
+  uint8_t* signingSeed
+)
+{
+  File file(InternalFS);
+
+  if (!file.open(path, FILE_O_READ))
+  {
+    return false;
+  }
+
+  uint8_t record[IDENTITY_RECORD_SIZE];
+  bool correctSize = file.size() == IDENTITY_RECORD_SIZE;
+  int32_t bytesRead = correctSize
+    ? file.read(record, sizeof(record))
+    : -1;
+  file.close();
+
+  if (
+    !correctSize ||
+    bytesRead != (int32_t)sizeof(record) ||
+    !validateIdentityRecord(record)
+  )
+  {
+    secureZero(record, sizeof(record));
+    return false;
+  }
+
+  memcpy(noiseSeed, record + 8, 32);
+  memcpy(signingSeed, record + 40, 32);
+  secureZero(record, sizeof(record));
+  return true;
+}
+
+bool writeIdentitySeeds(
+  const uint8_t* noiseSeed,
+  const uint8_t* signingSeed
+)
+{
+  uint8_t record[IDENTITY_RECORD_SIZE];
+  uint8_t digest[64];
+  memset(record, 0, sizeof(record));
+  memcpy(record, IDENTITY_RECORD_MAGIC, sizeof(IDENTITY_RECORD_MAGIC));
+  record[4] = IDENTITY_RECORD_VERSION;
+  memcpy(record + 8, noiseSeed, 32);
+  memcpy(record + 40, signingSeed, 32);
+
+  if (!calculateSha256(record, IDENTITY_RECORD_DATA_SIZE, digest))
+  {
+    secureZero(record, sizeof(record));
+    secureZero(digest, sizeof(digest));
+    return false;
+  }
+
+  memcpy(record + IDENTITY_RECORD_DATA_SIZE, digest, 32);
+  secureZero(digest, sizeof(digest));
+
+  if (InternalFS.exists(IDENTITY_TEMP_FILE_PATH))
+  {
+    InternalFS.remove(IDENTITY_TEMP_FILE_PATH);
+  }
+
+  File file(InternalFS);
+  if (!file.open(IDENTITY_TEMP_FILE_PATH, FILE_O_WRITE))
+  {
+    secureZero(record, sizeof(record));
+    return false;
+  }
+
+  size_t bytesWritten = file.write(record, sizeof(record));
+  file.flush();
+  file.close();
+  secureZero(record, sizeof(record));
+
+  if (bytesWritten != IDENTITY_RECORD_SIZE)
+  {
+    return false;
+  }
+
+  uint8_t verifiedNoiseSeed[32];
+  uint8_t verifiedSigningSeed[32];
+  bool tempValid = readIdentitySeeds(
+    IDENTITY_TEMP_FILE_PATH,
+    verifiedNoiseSeed,
+    verifiedSigningSeed
+  ) &&
+    memcmp(noiseSeed, verifiedNoiseSeed, 32) == 0 &&
+    memcmp(signingSeed, verifiedSigningSeed, 32) == 0;
+
+  secureZero(verifiedNoiseSeed, sizeof(verifiedNoiseSeed));
+  secureZero(verifiedSigningSeed, sizeof(verifiedSigningSeed));
+
+  if (!tempValid)
+  {
+    return false;
+  }
+
+  if (!InternalFS.rename(IDENTITY_TEMP_FILE_PATH, IDENTITY_FILE_PATH))
+  {
+    return false;
+  }
+
+  bool finalValid = readIdentitySeeds(
+    IDENTITY_FILE_PATH,
+    verifiedNoiseSeed,
+    verifiedSigningSeed
+  ) &&
+    memcmp(noiseSeed, verifiedNoiseSeed, 32) == 0 &&
+    memcmp(signingSeed, verifiedSigningSeed, 32) == 0;
+
+  secureZero(verifiedNoiseSeed, sizeof(verifiedNoiseSeed));
+  secureZero(verifiedSigningSeed, sizeof(verifiedSigningSeed));
+  return finalValid;
+}
+
+bool generateIdentitySeeds(uint8_t* noiseSeed, uint8_t* signingSeed)
+{
+  static nRFCrypto_Random random;
+
+  if (!random.begin())
+  {
+    return false;
+  }
+
+  bool generated =
+    random.generate(noiseSeed, 32) &&
+    random.generate(signingSeed, 32);
   random.end();
+  return generated;
+}
+
+bool deriveLocalIdentity(
+  const uint8_t* noiseSeed,
+  const uint8_t* signingSeed
+)
+{
+  uint8_t digest[64];
 
   static CRYS_ECMONT_TempBuff_t noiseTempBuffer;
   static CRYS_ECEDW_TempBuff_t signingTempBuffer;
@@ -467,7 +666,7 @@ bool initializeLocalIdentity()
     localIdentity.noisePrivateKey,
     &noisePrivateKeySize,
     noiseSeed,
-    sizeof(noiseSeed),
+    32,
     &noiseTempBuffer
   );
 
@@ -475,16 +674,13 @@ bool initializeLocalIdentity()
   size_t signingPublicKeySize = sizeof(localIdentity.signingPublicKey);
   CRYSError_t signingResult = CRYS_ECEDW_SeedKeyPair(
     signingSeed,
-    sizeof(signingSeed),
+    32,
     localIdentity.signingSecretKey,
     &signingSecretKeySize,
     localIdentity.signingPublicKey,
     &signingPublicKeySize,
     &signingTempBuffer
   );
-
-  memset(noiseSeed, 0, sizeof(noiseSeed));
-  memset(signingSeed, 0, sizeof(signingSeed));
 
   if (
     noiseResult != CRYS_OK ||
@@ -504,7 +700,91 @@ bool initializeLocalIdentity()
   memset(digest, 0, sizeof(digest));
   localIdentity.ready = true;
 
-  Serial.println("Local Bitchat identity: READY (ephemeral)");
+  return true;
+}
+
+bool initializeLocalIdentity()
+{
+  memset(&localIdentity, 0, sizeof(localIdentity));
+
+  if (!cryptoReady || !identityFileSystemReady)
+  {
+    return false;
+  }
+
+  uint8_t noiseSeed[32];
+  uint8_t signingSeed[32];
+  bool loaded = false;
+  bool created = false;
+
+  if (InternalFS.exists(IDENTITY_FILE_PATH))
+  {
+    loaded = readIdentitySeeds(
+      IDENTITY_FILE_PATH,
+      noiseSeed,
+      signingSeed
+    );
+
+    if (!loaded)
+    {
+      Serial.println("Local identity storage: INVALID");
+      secureZero(noiseSeed, sizeof(noiseSeed));
+      secureZero(signingSeed, sizeof(signingSeed));
+      return false;
+    }
+  }
+  else
+  {
+    // Recover a completely written temporary record after a power loss.
+    if (InternalFS.exists(IDENTITY_TEMP_FILE_PATH))
+    {
+      loaded = readIdentitySeeds(
+        IDENTITY_TEMP_FILE_PATH,
+        noiseSeed,
+        signingSeed
+      );
+
+      if (loaded)
+      {
+        loaded = InternalFS.rename(
+          IDENTITY_TEMP_FILE_PATH,
+          IDENTITY_FILE_PATH
+        );
+      }
+      else
+      {
+        InternalFS.remove(IDENTITY_TEMP_FILE_PATH);
+      }
+    }
+
+    if (!loaded)
+    {
+      bool generated = generateIdentitySeeds(noiseSeed, signingSeed);
+      created = generated && writeIdentitySeeds(noiseSeed, signingSeed);
+
+      if (!created)
+      {
+        Serial.println("Local identity storage: CREATE FAILED");
+        secureZero(noiseSeed, sizeof(noiseSeed));
+        secureZero(signingSeed, sizeof(signingSeed));
+        return false;
+      }
+    }
+  }
+
+  bool derived = deriveLocalIdentity(noiseSeed, signingSeed);
+  secureZero(noiseSeed, sizeof(noiseSeed));
+  secureZero(signingSeed, sizeof(signingSeed));
+
+  if (!derived)
+  {
+    return false;
+  }
+
+  Serial.print("Local identity storage: ");
+  Serial.println(created ? "CREATED" : "LOADED");
+
+  Serial.println("Local Bitchat identity: READY (persistent)");
   Serial.print("Local nickname: ");
   Serial.println(LOCAL_NICKNAME);
   Serial.print("Local Sender ID: ");
@@ -567,6 +847,252 @@ bool currentEpochMilliseconds(uint64_t* value)
   uint64_t epoch = ((uint64_t)epochHigh << 32) | epochLow;
   *value = epoch + (uint32_t)(millis() - millisAtSync);
   return true;
+}
+
+bool takeProtocolStateMutex()
+{
+  return protocolStateMutex != NULL &&
+    xSemaphoreTake(protocolStateMutex, pdMS_TO_TICKS(100)) == pdTRUE;
+}
+
+void rememberVerifiedPeer(
+  const uint8_t* senderId,
+  const uint8_t* signingPublicKey
+)
+{
+  if (!takeProtocolStateMutex())
+  {
+    Serial.println("Verified peer cache: LOCK TIMEOUT");
+    return;
+  }
+
+  memcpy(verifiedPeer.senderId, senderId, 8);
+  memcpy(verifiedPeer.signingPublicKey, signingPublicKey, 32);
+  verifiedPeer.ready = true;
+  xSemaphoreGive(protocolStateMutex);
+
+  Serial.println("Verified peer cache: UPDATED");
+}
+
+bool getVerifiedPeerSigningKey(
+  const uint8_t* senderId,
+  uint8_t* signingPublicKey
+)
+{
+  if (!takeProtocolStateMutex())
+  {
+    return false;
+  }
+
+  bool found = verifiedPeer.ready &&
+    memcmp(verifiedPeer.senderId, senderId, 8) == 0;
+  if (found)
+  {
+    memcpy(signingPublicKey, verifiedPeer.signingPublicKey, 32);
+  }
+
+  xSemaphoreGive(protocolStateMutex);
+  return found;
+}
+
+void cacheLocalAnnouncePacket(const uint8_t* packet, size_t packetLength)
+{
+  if (
+    packetLength > sizeof(lastLocalAnnouncePacket) ||
+    !takeProtocolStateMutex()
+  )
+  {
+    return;
+  }
+
+  memcpy(lastLocalAnnouncePacket, packet, packetLength);
+  lastLocalAnnouncePacketLength = packetLength;
+  xSemaphoreGive(protocolStateMutex);
+}
+
+bool getCachedLocalAnnouncePacket(uint8_t* packet, size_t* packetLength)
+{
+  if (!takeProtocolStateMutex())
+  {
+    return false;
+  }
+
+  bool available =
+    lastLocalAnnouncePacketLength > 0 &&
+    lastLocalAnnouncePacketLength <= MAX_ANNOUNCE_PACKET;
+  if (available)
+  {
+    memcpy(
+      packet,
+      lastLocalAnnouncePacket,
+      lastLocalAnnouncePacketLength
+    );
+    *packetLength = lastLocalAnnouncePacketLength;
+  }
+
+  xSemaphoreGive(protocolStateMutex);
+  return available;
+}
+
+bool calculatePacketId(
+  const uint8_t* packet,
+  size_t packetLength,
+  uint8_t* packetId
+)
+{
+  if (packetLength < 22 || packet[0] != 1)
+  {
+    return false;
+  }
+
+  uint16_t payloadLength = readBE16(packet + 12);
+  size_t payloadOffset = 22;
+  if (packet[11] & 0x01)
+  {
+    payloadOffset += 8;
+  }
+
+  if (
+    payloadOffset + payloadLength > packetLength ||
+    payloadLength > 128
+  )
+  {
+    return false;
+  }
+
+  uint8_t idInput[1 + 8 + 8 + 128];
+  size_t idInputLength = 0;
+  idInput[idInputLength++] = packet[1];
+  memcpy(idInput + idInputLength, packet + 14, 8);
+  idInputLength += 8;
+  memcpy(idInput + idInputLength, packet + 3, 8);
+  idInputLength += 8;
+  memcpy(idInput + idInputLength, packet + payloadOffset, payloadLength);
+  idInputLength += payloadLength;
+
+  uint8_t digest[64];
+  bool success = calculateSha256(idInput, idInputLength, digest);
+  if (success)
+  {
+    memcpy(packetId, digest, 16);
+  }
+
+  secureZero(idInput, sizeof(idInput));
+  secureZero(digest, sizeof(digest));
+  return success;
+}
+
+bool readGcsBit(
+  const uint8_t* data,
+  size_t dataLength,
+  size_t* bitOffset,
+  uint8_t* bit
+)
+{
+  if (*bitOffset >= dataLength * 8)
+  {
+    return false;
+  }
+
+  size_t byteOffset = *bitOffset / 8;
+  uint8_t shift = 7 - (*bitOffset % 8);
+  *bit = (data[byteOffset] >> shift) & 1;
+  (*bitOffset)++;
+  return true;
+}
+
+bool gcsFilterMightContain(
+  const RequestSyncPayload& request,
+  const uint8_t* packetId
+)
+{
+  if (
+    request.p < 1 ||
+    request.p > 32 ||
+    request.m <= 1 ||
+    request.gcsLength == 0
+  )
+  {
+    return false;
+  }
+
+  uint8_t digest[64];
+  if (!calculateSha256(packetId, 16, digest))
+  {
+    return false;
+  }
+
+  uint64_t hash = readBE64(digest) & 0x7FFFFFFFFFFFFFFFULL;
+  secureZero(digest, sizeof(digest));
+  uint64_t bucket = hash % request.m;
+  if (bucket == 0)
+  {
+    bucket = 1;
+  }
+
+  size_t bitOffset = 0;
+  uint64_t accumulator = 0;
+
+  while (bitOffset < (size_t)request.gcsLength * 8)
+  {
+    uint64_t quotient = 0;
+    uint8_t bit;
+
+    while (true)
+    {
+      if (!readGcsBit(
+            request.gcsData,
+            request.gcsLength,
+            &bitOffset,
+            &bit
+          ))
+      {
+        return false;
+      }
+
+      if (bit == 0)
+      {
+        break;
+      }
+
+      quotient++;
+    }
+
+    uint64_t remainder = 0;
+    for (uint8_t i = 0; i < request.p; i++)
+    {
+      if (!readGcsBit(
+            request.gcsData,
+            request.gcsLength,
+            &bitOffset,
+            &bit
+          ))
+      {
+        return false;
+      }
+
+      remainder = (remainder << 1) | bit;
+    }
+
+    uint64_t value = (quotient << request.p) + remainder + 1;
+    if (UINT64_MAX - accumulator < value)
+    {
+      return false;
+    }
+
+    accumulator += value;
+    if (accumulator == bucket)
+    {
+      return true;
+    }
+
+    if (accumulator > bucket || accumulator >= request.m)
+    {
+      return false;
+    }
+  }
+
+  return false;
 }
 
 bool appendTlv(
@@ -800,6 +1326,7 @@ bool sendLocalAnnounce()
     localAnnouncePending = false;
     localAnnounceSent = true;
     lastLocalAnnounceSentAt = millis();
+    cacheLocalAnnouncePacket(packet, packetLength);
     return true;
   }
 
@@ -809,6 +1336,105 @@ bool sendLocalAnnounce()
   Serial.print(packetLength);
   Serial.println(" bytes)");
   return false;
+}
+
+bool reserveRequestSyncResponse()
+{
+  uint32_t now = millis();
+  if (
+    requestSyncResponseWindowStartedAt == 0 ||
+    now - requestSyncResponseWindowStartedAt >=
+      REQUEST_SYNC_RESPONSE_WINDOW_MS
+  )
+  {
+    requestSyncResponseWindowStartedAt = now;
+    requestSyncResponseCount = 0;
+  }
+
+  if (requestSyncResponseCount >= REQUEST_SYNC_RESPONSE_LIMIT)
+  {
+    return false;
+  }
+
+  requestSyncResponseCount++;
+  return true;
+}
+
+bool sendRequestSyncAnnounceResponse()
+{
+  if (!bitchatLinkReady || !localIdentity.ready)
+  {
+    return false;
+  }
+
+  uint8_t packet[MAX_ANNOUNCE_PACKET];
+  size_t packetLength = 0;
+  if (!getCachedLocalAnnouncePacket(packet, &packetLength))
+  {
+    Serial.println("REQUEST_SYNC response: no cached local ANNOUNCE");
+    requestSyncResponsePending = false;
+    return false;
+  }
+
+  // TTL and RSR are mutable relay fields and are excluded from the signature.
+  packet[2] = 0;
+  packet[11] |= 0x10;
+
+  Serial.println();
+  Serial.println("=== REQUEST_SYNC ANNOUNCE RESPONSE TX ===");
+  Serial.print("Timestamp (ms): ");
+  printUInt64(readBE64(packet + 3));
+  Serial.println();
+  Serial.print("Sender ID: ");
+  printHex(localIdentity.senderId, sizeof(localIdentity.senderId));
+  Serial.println();
+  Serial.println("TTL: 0");
+  Serial.println("Flags: 0x12 [signature, RSR]");
+
+  uint16_t written = 0;
+  if (bitchatCharacteristicProperties & CHR_PROPS_WRITE_WO_RESP)
+  {
+    written = bitchatChar.write(packet, (uint16_t)packetLength);
+  }
+  else if (bitchatCharacteristicProperties & CHR_PROPS_WRITE)
+  {
+    written = bitchatChar.write_resp(packet, (uint16_t)packetLength);
+  }
+
+  Serial.print("GATT write: ");
+  if (written == packetLength)
+  {
+    Serial.print("OK (");
+    Serial.print(written);
+    Serial.println(" bytes)");
+    requestSyncResponsePending = false;
+    lastLocalAnnounceSentAt = millis();
+    return true;
+  }
+
+  Serial.print("FAILED (");
+  Serial.print(written);
+  Serial.print(" / ");
+  Serial.print(packetLength);
+  Serial.println(" bytes)");
+  return false;
+}
+
+void serviceRequestSyncResponse()
+{
+  if (!requestSyncResponsePending || !bitchatLinkReady)
+  {
+    return;
+  }
+
+  uint32_t now = millis();
+  if (now - lastRequestSyncResponseAttemptAt < ANNOUNCE_RETRY_MS)
+  {
+    return;
+  }
+
+  lastRequestSyncResponseAttemptAt = now;
+  sendRequestSyncAnnounceResponse();
 }
 
 void serviceLocalAnnounce()
@@ -835,6 +1461,341 @@ void serviceLocalAnnounce()
 
   lastLocalAnnounceAttemptAt = now;
   sendLocalAnnounce();
+}
+
+void printRequestSyncTypes(uint64_t types)
+{
+  struct SyncTypeName
+  {
+    uint8_t bit;
+    const char* name;
+  };
+
+  static const SyncTypeName names[] = {
+    {0, "announce"},
+    {1, "message"},
+    {2, "leave"},
+    {3, "noiseHandshake"},
+    {4, "noiseEncrypted"},
+    {5, "fragment"},
+    {6, "requestSync"},
+    {7, "fileTransfer"},
+    {8, "boardPost"},
+    {9, "prekeyBundle"},
+    {10, "groupMessage"}
+  };
+
+  bool first = true;
+  Serial.print('[');
+  for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+  {
+    if ((types & (1ULL << names[i].bit)) == 0)
+    {
+      continue;
+    }
+
+    if (!first)
+    {
+      Serial.print(", ");
+    }
+    Serial.print(names[i].name);
+    first = false;
+  }
+  Serial.println(']');
+}
+
+bool parseRequestSyncPayload(
+  const uint8_t* payload,
+  size_t payloadLength,
+  RequestSyncPayload* request
+)
+{
+  memset(request, 0, sizeof(*request));
+  bool hasP = false;
+  bool hasM = false;
+  bool hasGcsData = false;
+  size_t offset = 0;
+
+  Serial.println("--- REQUEST_SYNC PAYLOAD ---");
+
+  while (offset + 3 <= payloadLength)
+  {
+    uint8_t type = payload[offset++];
+    uint16_t length = readBE16(payload + offset);
+    offset += 2;
+
+    if (length > payloadLength - offset)
+    {
+      Serial.println("Malformed REQUEST_SYNC TLV: value exceeds payload");
+      return false;
+    }
+
+    const uint8_t* value = payload + offset;
+    switch (type)
+    {
+      case 0x01:
+        if (length != 1)
+        {
+          Serial.println("P: invalid length");
+          return false;
+        }
+        request->p = value[0];
+        hasP = true;
+        Serial.print("P: ");
+        Serial.println(request->p);
+        break;
+
+      case 0x02:
+        if (length != 4)
+        {
+          Serial.println("M: invalid length");
+          return false;
+        }
+        request->m = readBE32(value);
+        hasM = true;
+        Serial.print("M: ");
+        Serial.println(request->m);
+        break;
+
+      case 0x03:
+        if (length > MAX_REQUEST_SYNC_GCS)
+        {
+          Serial.println("GCS data: exceeds acceptance limit");
+          return false;
+        }
+        request->gcsData = value;
+        request->gcsLength = length;
+        hasGcsData = true;
+        Serial.print("GCS data [");
+        Serial.print(length);
+        Serial.print(" bytes]: ");
+        printHex(value, length);
+        Serial.println();
+        break;
+
+      case 0x04:
+        if (length < 1 || length > 8)
+        {
+          Serial.println("Types: invalid length");
+          return false;
+        }
+        request->types = 0;
+        for (uint8_t i = 0; i < length; i++)
+        {
+          request->types |= (uint64_t)value[i] << (i * 8);
+        }
+        request->hasTypes = true;
+        Serial.print("Types raw: 0x");
+        for (int16_t i = length - 1; i >= 0; i--)
+        {
+          if (value[i] < 0x10) Serial.print('0');
+          Serial.print(value[i], HEX);
+        }
+        Serial.print(' ');
+        printRequestSyncTypes(request->types);
+        break;
+
+      case 0x05:
+        if (length != 8)
+        {
+          Serial.println("Since timestamp: invalid length");
+          return false;
+        }
+        request->sinceTimestamp = readBE64(value);
+        request->hasSinceTimestamp = true;
+        Serial.print("Since timestamp (ms): ");
+        printUInt64(request->sinceTimestamp);
+        Serial.println();
+        break;
+
+      case 0x06:
+        if (length <= MAX_REQUEST_SYNC_GCS)
+        {
+          Serial.print("Fragment ID filter: ");
+          printText(value, length);
+          Serial.println();
+        }
+        else
+        {
+          Serial.println("Fragment ID filter: ignored (too large)");
+        }
+        break;
+
+      default:
+        Serial.print("Unknown REQUEST_SYNC TLV 0x");
+        if (type < 0x10) Serial.print('0');
+        Serial.print(type, HEX);
+        Serial.print(" [");
+        Serial.print(length);
+        Serial.println(" bytes]");
+        break;
+    }
+
+    offset += length;
+  }
+
+  if (offset != payloadLength)
+  {
+    Serial.println("Malformed REQUEST_SYNC payload: trailing bytes");
+    return false;
+  }
+
+  if (!request->hasTypes)
+  {
+    // Legacy requests cover public announcements and public messages.
+    request->types = (1ULL << 0) | (1ULL << 1);
+    Serial.print("Types default: ");
+    printRequestSyncTypes(request->types);
+  }
+
+  bool valid =
+    hasP &&
+    hasM &&
+    hasGcsData &&
+    request->p >= 1 &&
+    request->p <= 32 &&
+    request->m > 0;
+  Serial.print("REQUEST_SYNC fields: ");
+  Serial.println(valid ? "VALID" : "INVALID");
+  return valid;
+}
+
+void handleRequestSyncPacket(
+  const uint8_t* packet,
+  size_t signatureOffset,
+  const uint8_t* signature,
+  uint8_t ttl,
+  const uint8_t* senderId,
+  const uint8_t* recipientId,
+  const uint8_t* payload,
+  size_t payloadLength
+)
+{
+  Serial.println("--- REQUEST_SYNC VALIDATION ---");
+
+  if (ttl != 0)
+  {
+    Serial.println("REQUEST_SYNC rejected: TTL must be zero");
+    return;
+  }
+
+  if (
+    recipientId == NULL ||
+    !localIdentity.ready ||
+    memcmp(recipientId, localIdentity.senderId, 8) != 0
+  )
+  {
+    Serial.println("REQUEST_SYNC rejected: recipient is not local identity");
+    return;
+  }
+  Serial.println("Recipient verification: VALID");
+
+  if (signature == NULL)
+  {
+    Serial.println("REQUEST_SYNC rejected: signature is missing");
+    return;
+  }
+
+  uint8_t signingPublicKey[32];
+  if (!getVerifiedPeerSigningKey(senderId, signingPublicKey))
+  {
+    Serial.println("REQUEST_SYNC rejected: sender has no verified ANNOUNCE");
+    return;
+  }
+
+  bool signatureValid = verifyBitchatSignature(
+    packet,
+    signatureOffset,
+    signature,
+    signingPublicKey
+  );
+  secureZero(signingPublicKey, sizeof(signingPublicKey));
+  if (!signatureValid)
+  {
+    return;
+  }
+
+  RequestSyncPayload request;
+  if (!parseRequestSyncPayload(payload, payloadLength, &request))
+  {
+    return;
+  }
+
+  if ((request.types & (1ULL << 0)) == 0)
+  {
+    Serial.println("REQUEST_SYNC response: ANNOUNCE not requested");
+    return;
+  }
+
+  uint8_t announce[MAX_ANNOUNCE_PACKET];
+  size_t announceLength = 0;
+  if (!getCachedLocalAnnouncePacket(announce, &announceLength))
+  {
+    Serial.println("REQUEST_SYNC response: no cached local ANNOUNCE");
+    return;
+  }
+
+  uint8_t packetId[16];
+  bool idCalculated = calculatePacketId(
+    announce,
+    announceLength,
+    packetId
+  );
+  bool alreadyPresent = idCalculated &&
+    gcsFilterMightContain(request, packetId);
+  bool forcedMissing = false;
+
+#if FORCE_REQUEST_SYNC_MISSING_TEST
+  static bool forcedMissingTestUsed = false;
+  if (idCalculated && !forcedMissingTestUsed)
+  {
+    alreadyPresent = false;
+    forcedMissing = true;
+    forcedMissingTestUsed = true;
+  }
+#endif
+
+  Serial.print("Local ANNOUNCE packet ID: ");
+  if (idCalculated)
+  {
+    printHex(packetId, sizeof(packetId));
+    Serial.println();
+  }
+  else
+  {
+    Serial.println("CALCULATION FAILED");
+  }
+  secureZero(packetId, sizeof(packetId));
+  secureZero(announce, sizeof(announce));
+
+  if (!idCalculated)
+  {
+    return;
+  }
+
+  Serial.print("GCS membership: ");
+  if (forcedMissing)
+  {
+    Serial.println("FORCED MISSING (one-shot test)");
+  }
+  else
+  {
+    Serial.println(alreadyPresent ? "PRESENT" : "MISSING");
+  }
+  if (alreadyPresent)
+  {
+    Serial.println("REQUEST_SYNC response: not needed");
+    return;
+  }
+
+  if (!reserveRequestSyncResponse())
+  {
+    Serial.println("REQUEST_SYNC response: RATE LIMITED");
+    return;
+  }
+
+  requestSyncResponsePending = true;
+  Serial.println("REQUEST_SYNC response: RSR ANNOUNCE QUEUED");
 }
 
 bool parseAnnouncePayload(
@@ -1031,6 +1992,7 @@ void parse_bitchat_packet(const uint8_t* data, size_t len)
 
   // Variable sections begin after the fixed header and sender ID.
   size_t payloadOffset = offset;
+  const uint8_t* recipientId = NULL;
 
   if (flags & 0x01)
   {
@@ -1041,8 +2003,9 @@ void parse_bitchat_packet(const uint8_t* data, size_t len)
       return;
     }
 
+    recipientId = data + payloadOffset;
     Serial.print("Recipient ID: ");
-    printHex(data + payloadOffset, 8);
+    printHex(recipientId, 8);
     Serial.println();
     payloadOffset += 8;
   }
@@ -1210,9 +2173,30 @@ void parse_bitchat_packet(const uint8_t* data, size_t len)
 
       if (signatureValid && announceIdentityValid)
       {
+        rememberVerifiedPeer(senderId, announceSigningPublicKey);
         synchronizeClock(readBE64(data + 3));
         requestLocalAnnounce();
       }
+    }
+  }
+  else if (type == 0x21)
+  {
+    if (flags & 0x04)
+    {
+      Serial.println("REQUEST_SYNC rejected: compressed payload unsupported");
+    }
+    else
+    {
+      handleRequestSyncPacket(
+        data,
+        signatureOffset,
+        signature,
+        ttl,
+        senderId,
+        recipientId,
+        payload,
+        payloadLength
+      );
     }
   }
 }
@@ -1454,6 +2438,10 @@ void setup()
   // Configure one central connection.
   Bluefruit.begin(0, 1);
 
+  identityFileSystemReady = InternalFS.begin();
+  Serial.print("Identity filesystem: ");
+  Serial.println(identityFileSystemReady ? "READY" : "FAILED");
+
   cryptoReady = nRFCrypto.begin();
   Serial.print("Ed25519 verifier: ");
   Serial.println(cryptoReady ? "READY" : "FAILED");
@@ -1467,6 +2455,10 @@ void setup()
       cryptoReady = false;
     }
   }
+
+  protocolStateMutex = xSemaphoreCreateMutex();
+  Serial.print("Protocol state mutex: ");
+  Serial.println(protocolStateMutex != NULL ? "READY" : "FAILED");
 
   if (!initializeLocalIdentity())
   {
@@ -1494,12 +2486,19 @@ void setup()
 
   Serial.println("Scanning for Bitchat...");
 
+#if FORCE_REQUEST_SYNC_MISSING_TEST
+  Serial.println(
+    "WARNING: REQUEST_SYNC forced-missing one-shot test is ENABLED"
+  );
+#endif
+
   Bluefruit.Scanner.start(0);
 }
 
 
 void loop()
 {
+  serviceRequestSyncResponse();
   serviceLocalAnnounce();
 }
 
@@ -1716,6 +2715,16 @@ void disconnect_callback(
   bitchatLinkReady = false;
   bitchatCharacteristicProperties = 0;
   localAnnouncePending = false;
+  requestSyncResponsePending = false;
+  requestSyncResponseWindowStartedAt = 0;
+  requestSyncResponseCount = 0;
+
+  if (takeProtocolStateMutex())
+  {
+    secureZero(&verifiedPeer, sizeof(verifiedPeer));
+    xSemaphoreGive(protocolStateMutex);
+  }
+
   connecting = false;
 
   Serial.println("Scanning again...");
