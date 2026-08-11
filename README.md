@@ -196,5 +196,4 @@ information you do not intend to publish.
 
 ## License
 
-No license has been selected for this repository yet. Add an explicit license
-before inviting reuse or redistribution.
+This project is licensed under the [MIT License](LICENSE).
