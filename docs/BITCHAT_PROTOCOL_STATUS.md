@@ -539,6 +539,7 @@ use the actual GCS membership result.
 | REQUEST_SYNC authentication | Complete | Local recipient and Ed25519 signature both reported `VALID` on-device |
 | REQUEST_SYNC GCS membership | Complete for present-member path | Packet ID calculated and `PRESENT` observed on-device |
 | REQUEST_SYNC RSR response | Complete | TTL 0, flag `0x12`, and 168-byte GATT write observed on-device |
+| Public MESSAGE receive and display | Next milestone | Signed UTF-8 payload handling is planned before Noise work |
 | BLE peripheral role | Not implemented | Not required for the first central-role transmission test |
 | Noise XX handshake | Not implemented | Required for authenticated private communication |
 | Message transmission | Not implemented | Depends on peer presence and Noise work |
@@ -611,30 +612,93 @@ observed in the official iPhone app. Arduino CLI is not installed in this
 workspace, so builds here use the board package's ARM compiler for syntax and
 object checks.
 
-## Next Steps
+## Immediate Milestone: Public MESSAGE Receive and Display
 
-### Receiver Hardening
+The next implementation target is deliberately limited to displaying a signed
+public `MESSAGE` (`0x02`) from the iPhone on the XIAO serial console. Public
+transmission, the BLE peripheral role, Noise, private messages, group-message
+decryption, and media are out of scope until this milestone passes.
 
-1. Introduce a peer registry with parsed, signature-verified, and
-   Noise-authenticated states.
-2. Replace the single fragment assembly with a bounded table keyed by sender ID
-   and fragment ID.
-3. Add compressed-payload support if observed traffic requires it.
-4. Add replay and timestamp policy before treating announcements as trusted
-   presence.
+The current official implementation treats a public `MESSAGE` packet payload
+as UTF-8 text directly. It does not use the larger binary `BitchatMessage`
+object encoding used by other application paths. The packet header supplies
+the sender ID and timestamp, and the display name comes from the previously
+verified announcement.
 
-### Transmit and Session Phase
+### Phase 1: Capture the Wire Sample
 
-1. Flash the persistence build, record the first-boot sender ID, restart the
-   board, and confirm `LOADED` plus an identical sender ID and public keys.
-2. Define an explicit identity reset and backup policy before relying on the
-   board as a long-lived peer.
-3. Enable the BLE peripheral role and expose the expected Bitchat GATT service
-   for full dual-role mesh participation.
-4. Add outbound fragmentation for packet types that exceed the active link MTU.
-5. Implement the Noise XX handshake and bind the authenticated Noise identity to
-   the announced peer state.
-6. Implement encrypted message send and receive paths.
+1. Send a short public message from the connected iPhone.
+2. Capture the complete `MESSAGE (0x02)` packet, including flags, payload,
+   signature, and any fragment sequence.
+3. Confirm that the payload bytes decode directly as the text entered on the
+   iPhone and that the packet uses the expected signing representation.
+
+Exit criterion: one complete live public-message packet is accounted for byte
+by byte.
+
+### Phase 2: Authenticate and Decode
+
+1. Add a `MESSAGE` branch to the packet parser.
+2. Require the sender to match the active-link verified peer cache.
+3. Require and verify the Ed25519 packet signature with the signing key learned
+   from that peer's verified announcement.
+4. Reject compressed payloads until decompression support exists.
+5. Validate the complete payload as UTF-8 before printing it.
+6. Print sender nickname, sender ID, timestamp, TTL, byte length, and content.
+
+Expected output:
+
+```text
+--- PUBLIC MESSAGE ---
+Sender: anon8168
+Sender ID: 29-6F-2F-21-F2-88-95-43
+Timestamp (ms): ...
+Signature verification: VALID
+Content: hello xiao
+```
+
+Exit criterion: a correctly signed message is displayed, while a missing or
+invalid signature never reaches the content log.
+
+### Phase 3: Acceptance Policy
+
+1. Add a bounded packet-ID ring to suppress duplicate mesh or sync copies.
+2. Reject self-echo packets that are not valid solicited responses.
+3. Apply the upstream six-hour public-message freshness window using the
+   synchronized clock.
+4. Continue accepting a message after existing fragment reassembly when the
+   inner packet passes the same authentication and freshness checks.
+
+Exit criterion: repeated copies print once, and stale or malformed packets are
+logged as rejected without printing attacker-controlled content.
+
+### Phase 4: Hardware Test Matrix
+
+| Case | Expected result |
+| --- | --- |
+| Short ASCII text | Printed once with valid sender and signature |
+| Japanese text and emoji | Printed without UTF-8 corruption |
+| Duplicate packet | Second copy suppressed |
+| Missing or invalid signature | Rejected before content output |
+| Unknown sender ID | Rejected because no verified signing key exists |
+| Long fragmented text | Reassembled, authenticated, and printed once |
+| Message older than six hours | Rejected by freshness policy |
+
+Completion criterion: all applicable cases pass on the XIAO, with the captured
+serial evidence added to this document.
+
+## Deferred Work After Public Receive
+
+1. Encode, sign, and transmit a public `MESSAGE` from the XIAO.
+2. Persist or bound a multi-peer verified registry and replace the single
+   fragment assembly with a sender-ID/fragment-ID keyed table.
+3. Define an explicit local-identity reset and backup policy.
+4. Enable the BLE peripheral role for full dual-role mesh participation.
+5. Add outbound fragmentation for packets larger than the active link MTU.
+6. Implement `Noise_XX_25519_ChaChaPoly_SHA256`, bind the authenticated static
+   key to the announcement identity, and receive private messages.
+7. Add private-message transmission, receipts, group sessions, and media in
+   later milestones.
 
 ## Upstream References
 
