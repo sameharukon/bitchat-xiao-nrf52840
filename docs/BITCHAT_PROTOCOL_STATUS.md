@@ -1,4 +1,4 @@
-# Bitchat BLE Receiver: Design and Implementation Status
+# Bitchat BLE Peer: Design and Implementation Status
 
 Last updated: 2026-08-11
 
@@ -10,10 +10,12 @@ version 1 `ANNOUNCE`, derive its sender ID from the Noise public key, and verify
 its Ed25519 signature. Valid sender-ID and signature results have both been
 observed on the XIAO hardware.
 
-The receiver path is substantially complete for uncompressed version 1
-announcements. Transmitting an announcement, appearing as a peer in the
-official app, running the Noise XX handshake, and exchanging messages have not
-been implemented yet.
+The firmware now also generates an ephemeral local X25519/Ed25519 identity,
+encodes and signs a local version 1 `ANNOUNCE`, and writes it to the remote
+Bitchat characteristic. The official iPhone app accepted the live outbound
+announcement and displayed the XIAO as `xiao52840`. Persistent keys, the BLE
+peripheral role, the Noise XX handshake, and message exchange have not been
+implemented yet.
 
 ## Current Data Flow
 
@@ -29,6 +31,9 @@ flowchart LR
     H --> E
     F -->|ANNOUNCE 0x01| I[Announcement TLV decoder]
     I --> J[Ed25519 signature verification]
+    J -->|signature and sender ID valid| K[Epoch clock sync]
+    K --> L[Build and sign local ANNOUNCE]
+    L --> M[GATT write to Bitchat peer]
 ```
 
 The implementation uses static buffers and does not allocate packet storage on
@@ -55,6 +60,11 @@ The scanner checks the raw little-endian UUID bytes in advertisement data. A
 matching device is connected automatically. After service and characteristic
 discovery, notifications are enabled and the connection requests an ATT MTU of
 247.
+
+The official characteristic supports notification, write, and write without
+response. The XIAO therefore sends its first outbound packets over the existing
+central-to-peripheral connection; a local GATT peripheral is not required for
+this first interoperability test.
 
 Observed successful MTU exchange:
 
@@ -308,6 +318,49 @@ an arbitrary public key. Possession of the Noise private key must be established
 by the authenticated Noise handshake. Parsed, signature-verified, and
 Noise-authenticated peer state must therefore remain distinct.
 
+## Outbound Announcement Prototype
+
+The local announcement uses the following values:
+
+| Field | Current value |
+| --- | --- |
+| Version | `1` |
+| Type | `ANNOUNCE` (`0x01`) |
+| TTL | `7` |
+| Nickname | `xiao52840` |
+| Capabilities | Empty set, encoded as `05-01-00` |
+| Sender ID | First 8 bytes of SHA-256 over the local Noise public key |
+| Wire packet size | 168 bytes |
+| Canonical signing data | 256 bytes |
+
+At startup, CryptoCell generates independent random seeds for an X25519 key
+pair and an Ed25519 key pair. The keys are held in RAM and are regenerated on
+every boot. This is intentional for the first transmission test, but it means
+the XIAO has a different peer identity after every restart.
+
+The board has no trusted wall clock. It accepts a timestamp as a clock source
+only after the incoming announcement has both a valid sender-ID fingerprint and
+a valid Ed25519 signature. The local clock then advances from `millis()`. A
+local announcement is sent after synchronization and every 20 seconds while the
+link remains active.
+
+Expected transmission log:
+
+```text
+Local Bitchat identity: READY (ephemeral)
+Local nickname: xiao52840
+Local Sender ID: ...
+...
+Local ANNOUNCE signature self-check: VALID
+=== LOCAL ANNOUNCE TX ===
+Packet length: 168
+GATT write: OK (168 bytes)
+```
+
+The firmware prefers write without response, matching the current upstream BLE
+sender, and falls back to a write with response when required by the discovered
+characteristic.
+
 ## Implementation Status
 
 | Area | Status | Notes |
@@ -328,8 +381,12 @@ Noise-authenticated peer state must therefore remain distinct.
 | Ed25519 verification | Complete | `VALID` observed on the XIAO with a live announcement |
 | Compressed payload decoding | Not implemented | Parser logs and skips compressed payloads |
 | Peer registry | Not implemented | No persistent verified-peer state |
-| ANNOUNCE transmission | Not implemented | Receiver only |
-| BLE peripheral role | Not implemented | Firmware currently starts with zero peripheral links |
+| Local X25519 identity | Implemented | Ephemeral; regenerated on every boot |
+| Local Ed25519 identity | Implemented | Ephemeral; private key retained for signing |
+| ANNOUNCE encoding and signing | Implemented | 168-byte wire packet; 256-byte signing representation |
+| ANNOUNCE GATT transmission | Complete | Live 168-byte transmission reached the iPhone app |
+| Official-app peer display | Complete | `xiao52840` observed in the iPhone app |
+| BLE peripheral role | Not implemented | Not required for the first central-role transmission test |
 | Noise XX handshake | Not implemented | Required for authenticated private communication |
 | Message transmission | Not implemented | Depends on peer presence and Noise work |
 
@@ -342,6 +399,7 @@ MAX_FRAGMENTS      = 16
 MAX_FRAGMENT_DATA  = 480
 MAX_REASSEMBLED    = 8192
 MAX_SIGNING_DATA   = 2048
+MAX_ANNOUNCE_PACKET = 256
 ```
 
 The current fragment storage reserves approximately 7.7 KiB, and the signing
@@ -353,6 +411,9 @@ Signature verification runs synchronously in the notification processing path.
 CryptoCell acceleration keeps the operation small, and announcements are
 infrequent, but this should be monitored when more traffic types are handled.
 If BLE timing is affected, verification should move to a bounded work queue.
+Inbound verification and outbound signing share a FreeRTOS mutex so the
+CryptoCell backend is never entered concurrently from the BLE callback and the
+Arduino loop. Lock acquisition has a one-second timeout and fails closed.
 
 ## Verification and Build Evidence
 
@@ -362,16 +423,24 @@ If BLE timing is affected, verification should move to a bounded work queue.
   independently and on the XIAO hardware.
 - The captured Ed25519 signature validates against the reconstructed 256-byte
   canonical signing data both independently and on the XIAO hardware.
+- The locally generated announcement passes its on-device Ed25519 signature
+  self-check before transmission.
+- The official iPhone app received the local announcement and displayed
+  `xiao52840` as a peer.
 - The source passes `git diff --check`.
 - The sketch passes a C++11 syntax check with the XIAO nRF52840 ARM compiler.
 - Object generation with the XIAO toolchain succeeded.
-- The linked Adafruit nRFCrypto archive exports `CRYS_ECEDW_Verify`.
+- The linked Adafruit nRFCrypto archive exports `CRYS_ECEDW_Verify`,
+  `CRYS_ECEDW_Sign`, `CRYS_ECEDW_SeedKeyPair`, and
+  `CRYS_ECMONT_SeedKeyPair`.
 
 The verification firmware was built and uploaded through the user's Arduino
 environment. `Sender ID verification: VALID` and `Signature verification:
 VALID (signed data: 256 bytes)` were both observed for the same live
-announcement. Arduino CLI is not installed in this workspace, so builds here
-use the board package's ARM compiler for syntax and object checks.
+announcement. The outbound firmware was then uploaded, and `xiao52840` was
+observed in the official iPhone app. Arduino CLI is not installed in this
+workspace, so builds here use the board package's ARM compiler for syntax and
+object checks.
 
 ## Next Steps
 
@@ -387,20 +456,20 @@ use the board package's ARM compiler for syntax and object checks.
 
 ### Transmit and Session Phase
 
-1. Enable the BLE peripheral role and expose the expected Bitchat GATT service.
-2. Generate or provision X25519 Noise and Ed25519 signing key pairs.
-3. Derive the local sender ID from the Noise public-key SHA-256 prefix.
-4. Encode, sign, fragment, and transmit a valid `ANNOUNCE`.
-5. Confirm that the official iPhone app displays the XIAO as a peer.
-6. Implement the Noise XX handshake and bind the authenticated Noise identity to
+1. Persist the X25519 and Ed25519 keys so the local identity survives reboot.
+2. Enable the BLE peripheral role and expose the expected Bitchat GATT service
+   for full dual-role mesh participation.
+3. Add outbound fragmentation for packet types that exceed the active link MTU.
+4. Implement the Noise XX handshake and bind the authenticated Noise identity to
    the announced peer state.
-7. Implement encrypted message send and receive paths.
+5. Implement encrypted message send and receive paths.
 
 ## Upstream References
 
-The implementation was compared with the current official Bitchat source on
-2026-08-11. Re-check these sources before changing the wire protocol because
-the upstream project is active.
+The implementation was compared with official Bitchat commit
+`9b84b361225facd8e623f25d76f889d3dc54a879` on 2026-08-11. Re-check these
+sources before changing the wire protocol because the upstream project is
+active.
 
 - [Binary packet encoding and decoding](https://github.com/permissionlesstech/bitchat/blob/main/localPackages/BitFoundation/Sources/BitFoundation/BinaryProtocol.swift)
 - [Packet signing representation](https://github.com/permissionlesstech/bitchat/blob/main/localPackages/BitFoundation/Sources/BitFoundation/BitchatPacket.swift)

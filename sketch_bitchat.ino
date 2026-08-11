@@ -1,11 +1,27 @@
 #include <bluefruit.h>
 #include <Adafruit_nRFCrypto.h>
 #include <nrf_cc310/include/crys_ec_edw_api.h>
+#include <nrf_cc310/include/crys_ec_mont_api.h>
 
 #define MAX_FRAGMENTS      16
 #define MAX_FRAGMENT_DATA  480
 #define MAX_REASSEMBLED    8192
 #define MAX_SIGNING_DATA   2048
+#define MAX_ANNOUNCE_PACKET 256
+
+static const char LOCAL_NICKNAME[] = "xiao52840";
+static const uint32_t ANNOUNCE_INTERVAL_MS = 20000;
+static const uint32_t ANNOUNCE_RETRY_MS = 1000;
+
+struct LocalIdentity
+{
+  bool ready;
+  uint8_t noisePrivateKey[32];
+  uint8_t noisePublicKey[32];
+  uint8_t signingSecretKey[64];
+  uint8_t signingPublicKey[32];
+  uint8_t senderId[8];
+};
 
 struct FragmentAssembly
 {
@@ -26,6 +42,8 @@ struct FragmentAssembly
 };
 
 FragmentAssembly fragmentAssembly;
+LocalIdentity localIdentity;
+SemaphoreHandle_t cryptoMutex = NULL;
 
 // Bitchat Service UUID
 BLEClientService bitchatService(
@@ -48,6 +66,18 @@ static const uint8_t bitchatUuidLE[] = {
 
 bool connecting = false;
 bool cryptoReady = false;
+volatile bool bitchatLinkReady = false;
+volatile uint8_t bitchatCharacteristicProperties = 0;
+volatile bool localAnnouncePending = false;
+volatile bool localAnnounceSent = false;
+volatile uint32_t lastLocalAnnounceSentAt = 0;
+uint32_t lastLocalAnnounceAttemptAt = 0;
+
+volatile uint32_t clockGeneration = 0;
+volatile uint32_t clockEpochHigh = 0;
+volatile uint32_t clockEpochLow = 0;
+volatile uint32_t clockMillisAtSync = 0;
+volatile bool clockSynced = false;
 
 void parse_bitchat_packet(const uint8_t* data, size_t len);
 void handle_fragment(const uint8_t* payload, uint16_t payloadLength);
@@ -83,6 +113,20 @@ uint64_t readBE64(const uint8_t* p)
   }
 
   return value;
+}
+
+void writeBE16(uint8_t* p, uint16_t value)
+{
+  p[0] = (uint8_t)(value >> 8);
+  p[1] = (uint8_t)value;
+}
+
+void writeBE64(uint8_t* p, uint64_t value)
+{
+  for (int8_t i = 7; i >= 0; i--)
+  {
+    p[7 - i] = (uint8_t)(value >> (i * 8));
+  }
 }
 
 void printUInt64(uint64_t value)
@@ -232,7 +276,45 @@ size_t signingDataLengthWithPadding(size_t unpaddedLength)
   return unpaddedLength;
 }
 
-void verifyBitchatSignature(
+bool calculateSha256(uint8_t* data, size_t length, uint8_t* digest)
+{
+  static nRFCrypto_Hash hash;
+
+  if (
+    cryptoMutex == NULL ||
+    xSemaphoreTake(cryptoMutex, pdMS_TO_TICKS(1000)) != pdTRUE
+  )
+  {
+    return false;
+  }
+
+  bool success = false;
+  if (
+    hash.begin(CRYS_HASH_SHA256_mode) &&
+    hash.update(data, length)
+  )
+  {
+    success = hash.end(digest) == 32;
+  }
+
+  xSemaphoreGive(cryptoMutex);
+  return success;
+}
+
+bool takeCryptoMutex()
+{
+  if (
+    cryptoMutex == NULL ||
+    xSemaphoreTake(cryptoMutex, pdMS_TO_TICKS(1000)) != pdTRUE
+  )
+  {
+    return false;
+  }
+
+  return true;
+}
+
+bool verifyBitchatSignature(
   const uint8_t* packet,
   size_t signatureOffset,
   const uint8_t* signature,
@@ -244,14 +326,14 @@ void verifyBitchatSignature(
   if (!cryptoReady)
   {
     Serial.println("UNAVAILABLE (CryptoCell initialization failed)");
-    return;
+    return false;
   }
 
   size_t signingLength = signingDataLengthWithPadding(signatureOffset);
   if (signingLength > MAX_SIGNING_DATA)
   {
     Serial.println("SKIPPED (signing data exceeds buffer)");
-    return;
+    return false;
   }
 
   static uint8_t signingData[MAX_SIGNING_DATA];
@@ -280,6 +362,12 @@ void verifyBitchatSignature(
 
   memset(&tempBuffer, 0, sizeof(tempBuffer));
 
+  if (!takeCryptoMutex())
+  {
+    Serial.println("SKIPPED (CryptoCell lock timeout)");
+    return false;
+  }
+
   CRYSError_t result = CRYS_ECEDW_Verify(
     signature,
     64,
@@ -290,20 +378,23 @@ void verifyBitchatSignature(
     &tempBuffer
   );
 
+  xSemaphoreGive(cryptoMutex);
+
   if (result == CRYS_OK)
   {
     Serial.print("VALID (signed data: ");
     Serial.print(signingLength);
     Serial.println(" bytes)");
-    return;
+    return true;
   }
 
   Serial.print("INVALID (CryptoCell error: 0x");
   Serial.print((uint32_t)result, HEX);
   Serial.println(")");
+  return false;
 }
 
-void verifyNoiseKeySenderId(
+bool verifyNoiseKeySenderId(
   const uint8_t* senderId,
   uint8_t* noisePublicKey
 )
@@ -314,35 +405,436 @@ void verifyNoiseKeySenderId(
   {
     Serial.println("UNAVAILABLE");
     Serial.println("Sender ID verification: UNAVAILABLE");
-    return;
+    return false;
   }
 
-  static nRFCrypto_Hash hash;
   uint8_t digest[64];
 
-  if (
-    !hash.begin(CRYS_HASH_SHA256_mode) ||
-    !hash.update(noisePublicKey, 32)
-  )
+  if (!calculateSha256(noisePublicKey, 32, digest))
   {
     Serial.println("HASH ERROR");
     Serial.println("Sender ID verification: ERROR");
-    return;
-  }
-
-  uint8_t digestLength = hash.end(digest);
-  if (digestLength != 32)
-  {
-    Serial.println("HASH ERROR");
-    Serial.println("Sender ID verification: ERROR");
-    return;
+    return false;
   }
 
   printHex(digest, 8);
   Serial.println();
 
+  bool matches = memcmp(senderId, digest, 8) == 0;
   Serial.print("Sender ID verification: ");
-  Serial.println(memcmp(senderId, digest, 8) == 0 ? "VALID" : "INVALID");
+  Serial.println(matches ? "VALID" : "INVALID");
+  return matches;
+}
+
+bool initializeLocalIdentity()
+{
+  memset(&localIdentity, 0, sizeof(localIdentity));
+
+  if (!cryptoReady)
+  {
+    return false;
+  }
+
+  static nRFCrypto_Random random;
+  uint8_t noiseSeed[32];
+  uint8_t signingSeed[32];
+  uint8_t digest[64];
+
+  if (
+    !random.begin() ||
+    !random.generate(noiseSeed, sizeof(noiseSeed)) ||
+    !random.generate(signingSeed, sizeof(signingSeed))
+  )
+  {
+    random.end();
+    memset(noiseSeed, 0, sizeof(noiseSeed));
+    memset(signingSeed, 0, sizeof(signingSeed));
+    return false;
+  }
+
+  random.end();
+
+  static CRYS_ECMONT_TempBuff_t noiseTempBuffer;
+  static CRYS_ECEDW_TempBuff_t signingTempBuffer;
+  memset(&noiseTempBuffer, 0, sizeof(noiseTempBuffer));
+  memset(&signingTempBuffer, 0, sizeof(signingTempBuffer));
+
+  size_t noisePublicKeySize = sizeof(localIdentity.noisePublicKey);
+  size_t noisePrivateKeySize = sizeof(localIdentity.noisePrivateKey);
+  CRYSError_t noiseResult = CRYS_ECMONT_SeedKeyPair(
+    localIdentity.noisePublicKey,
+    &noisePublicKeySize,
+    localIdentity.noisePrivateKey,
+    &noisePrivateKeySize,
+    noiseSeed,
+    sizeof(noiseSeed),
+    &noiseTempBuffer
+  );
+
+  size_t signingSecretKeySize = sizeof(localIdentity.signingSecretKey);
+  size_t signingPublicKeySize = sizeof(localIdentity.signingPublicKey);
+  CRYSError_t signingResult = CRYS_ECEDW_SeedKeyPair(
+    signingSeed,
+    sizeof(signingSeed),
+    localIdentity.signingSecretKey,
+    &signingSecretKeySize,
+    localIdentity.signingPublicKey,
+    &signingPublicKeySize,
+    &signingTempBuffer
+  );
+
+  memset(noiseSeed, 0, sizeof(noiseSeed));
+  memset(signingSeed, 0, sizeof(signingSeed));
+
+  if (
+    noiseResult != CRYS_OK ||
+    noisePublicKeySize != 32 ||
+    noisePrivateKeySize != 32 ||
+    signingResult != CRYS_OK ||
+    signingSecretKeySize != 64 ||
+    signingPublicKeySize != 32 ||
+    !calculateSha256(localIdentity.noisePublicKey, 32, digest)
+  )
+  {
+    memset(&localIdentity, 0, sizeof(localIdentity));
+    return false;
+  }
+
+  memcpy(localIdentity.senderId, digest, sizeof(localIdentity.senderId));
+  memset(digest, 0, sizeof(digest));
+  localIdentity.ready = true;
+
+  Serial.println("Local Bitchat identity: READY (ephemeral)");
+  Serial.print("Local nickname: ");
+  Serial.println(LOCAL_NICKNAME);
+  Serial.print("Local Sender ID: ");
+  printHex(localIdentity.senderId, sizeof(localIdentity.senderId));
+  Serial.println();
+  Serial.print("Local Noise public key: ");
+  printHex(localIdentity.noisePublicKey, sizeof(localIdentity.noisePublicKey));
+  Serial.println();
+  Serial.print("Local signing public key: ");
+  printHex(localIdentity.signingPublicKey, sizeof(localIdentity.signingPublicKey));
+  Serial.println();
+
+  return true;
+}
+
+void synchronizeClock(uint64_t epochMilliseconds)
+{
+  clockGeneration++;
+  clockEpochHigh = (uint32_t)(epochMilliseconds >> 32);
+  clockEpochLow = (uint32_t)epochMilliseconds;
+  clockMillisAtSync = millis();
+  clockSynced = true;
+  clockGeneration++;
+}
+
+bool currentEpochMilliseconds(uint64_t* value)
+{
+  uint32_t generationBefore;
+  uint32_t generationAfter;
+  uint32_t epochHigh;
+  uint32_t epochLow;
+  uint32_t millisAtSync;
+  bool isSynced;
+
+  while (true)
+  {
+    generationBefore = clockGeneration;
+    if (generationBefore & 1) continue;
+
+    epochHigh = clockEpochHigh;
+    epochLow = clockEpochLow;
+    millisAtSync = clockMillisAtSync;
+    isSynced = clockSynced;
+    generationAfter = clockGeneration;
+
+    if (
+      generationBefore == generationAfter &&
+      !(generationAfter & 1)
+    )
+    {
+      break;
+    }
+  }
+
+  if (!isSynced)
+  {
+    return false;
+  }
+
+  uint64_t epoch = ((uint64_t)epochHigh << 32) | epochLow;
+  *value = epoch + (uint32_t)(millis() - millisAtSync);
+  return true;
+}
+
+bool appendTlv(
+  uint8_t* payload,
+  size_t capacity,
+  size_t* offset,
+  uint8_t type,
+  const uint8_t* value,
+  size_t valueLength
+)
+{
+  if (valueLength > 255 || *offset + 2 + valueLength > capacity)
+  {
+    return false;
+  }
+
+  payload[(*offset)++] = type;
+  payload[(*offset)++] = (uint8_t)valueLength;
+  memcpy(payload + *offset, value, valueLength);
+  *offset += valueLength;
+  return true;
+}
+
+bool buildLocalAnnounce(
+  uint64_t timestamp,
+  uint8_t* packet,
+  size_t packetCapacity,
+  size_t* packetLength
+)
+{
+  if (!localIdentity.ready)
+  {
+    return false;
+  }
+
+  uint8_t payload[128];
+  size_t payloadLength = 0;
+  uint8_t noCapabilities = 0;
+
+  if (
+    !appendTlv(
+      payload,
+      sizeof(payload),
+      &payloadLength,
+      0x01,
+      (const uint8_t*)LOCAL_NICKNAME,
+      strlen(LOCAL_NICKNAME)
+    ) ||
+    !appendTlv(
+      payload,
+      sizeof(payload),
+      &payloadLength,
+      0x02,
+      localIdentity.noisePublicKey,
+      sizeof(localIdentity.noisePublicKey)
+    ) ||
+    !appendTlv(
+      payload,
+      sizeof(payload),
+      &payloadLength,
+      0x03,
+      localIdentity.signingPublicKey,
+      sizeof(localIdentity.signingPublicKey)
+    ) ||
+    !appendTlv(
+      payload,
+      sizeof(payload),
+      &payloadLength,
+      0x05,
+      &noCapabilities,
+      1
+    )
+  )
+  {
+    return false;
+  }
+
+  size_t unsignedLength = 14 + 8 + payloadLength;
+  size_t totalLength = unsignedLength + 64;
+  if (totalLength > packetCapacity || payloadLength > UINT16_MAX)
+  {
+    return false;
+  }
+
+  packet[0] = 1;
+  packet[1] = 0x01;
+  packet[2] = 7;
+  writeBE64(packet + 3, timestamp);
+  packet[11] = 0x02;
+  writeBE16(packet + 12, (uint16_t)payloadLength);
+  memcpy(packet + 14, localIdentity.senderId, 8);
+  memcpy(packet + 22, payload, payloadLength);
+
+  size_t signingLength = signingDataLengthWithPadding(unsignedLength);
+  if (signingLength > MAX_SIGNING_DATA)
+  {
+    return false;
+  }
+
+  static uint8_t signingData[MAX_SIGNING_DATA];
+  static CRYS_ECEDW_TempBuff_t signingTempBuffer;
+  memcpy(signingData, packet, unsignedLength);
+  signingData[2] = 0;
+  signingData[11] = 0;
+
+  if (signingLength > unsignedLength)
+  {
+    size_t paddingLength = signingLength - unsignedLength;
+    memset(
+      signingData + unsignedLength,
+      (uint8_t)paddingLength,
+      paddingLength
+    );
+  }
+
+  size_t signatureLength = 64;
+  memset(&signingTempBuffer, 0, sizeof(signingTempBuffer));
+
+  if (!takeCryptoMutex())
+  {
+    Serial.println("Local ANNOUNCE signing error: CryptoCell lock timeout");
+    return false;
+  }
+
+  CRYSError_t signResult = CRYS_ECEDW_Sign(
+    packet + unsignedLength,
+    &signatureLength,
+    signingData,
+    signingLength,
+    localIdentity.signingSecretKey,
+    sizeof(localIdentity.signingSecretKey),
+    &signingTempBuffer
+  );
+
+  if (signResult != CRYS_OK || signatureLength != 64)
+  {
+    xSemaphoreGive(cryptoMutex);
+    Serial.print("Local ANNOUNCE signing error: 0x");
+    Serial.println((uint32_t)signResult, HEX);
+    return false;
+  }
+
+  memset(&signingTempBuffer, 0, sizeof(signingTempBuffer));
+  CRYSError_t verifyResult = CRYS_ECEDW_Verify(
+    packet + unsignedLength,
+    64,
+    localIdentity.signingPublicKey,
+    sizeof(localIdentity.signingPublicKey),
+    signingData,
+    signingLength,
+    &signingTempBuffer
+  );
+
+  xSemaphoreGive(cryptoMutex);
+
+  Serial.print("Local ANNOUNCE signature self-check: ");
+  Serial.println(verifyResult == CRYS_OK ? "VALID" : "INVALID");
+  if (verifyResult != CRYS_OK)
+  {
+    return false;
+  }
+
+  *packetLength = totalLength;
+  return true;
+}
+
+void requestLocalAnnounce()
+{
+  if (
+    !localAnnounceSent ||
+    millis() - lastLocalAnnounceSentAt >= 5000
+  )
+  {
+    localAnnouncePending = true;
+  }
+}
+
+bool sendLocalAnnounce()
+{
+  if (!bitchatLinkReady || !localIdentity.ready)
+  {
+    return false;
+  }
+
+  uint64_t timestamp;
+  if (!currentEpochMilliseconds(&timestamp))
+  {
+    return false;
+  }
+
+  uint8_t packet[MAX_ANNOUNCE_PACKET];
+  size_t packetLength = 0;
+  if (!buildLocalAnnounce(
+        timestamp,
+        packet,
+        sizeof(packet),
+        &packetLength
+      ))
+  {
+    Serial.println("Local ANNOUNCE build: FAILED");
+    return false;
+  }
+
+  Serial.println();
+  Serial.println("=== LOCAL ANNOUNCE TX ===");
+  Serial.print("Timestamp (ms): ");
+  printUInt64(timestamp);
+  Serial.println();
+  Serial.print("Sender ID: ");
+  printHex(localIdentity.senderId, sizeof(localIdentity.senderId));
+  Serial.println();
+  Serial.print("Packet length: ");
+  Serial.println(packetLength);
+
+  uint16_t written = 0;
+  if (bitchatCharacteristicProperties & CHR_PROPS_WRITE_WO_RESP)
+  {
+    written = bitchatChar.write(packet, (uint16_t)packetLength);
+  }
+  else if (bitchatCharacteristicProperties & CHR_PROPS_WRITE)
+  {
+    written = bitchatChar.write_resp(packet, (uint16_t)packetLength);
+  }
+
+  Serial.print("GATT write: ");
+  if (written == packetLength)
+  {
+    Serial.print("OK (");
+    Serial.print(written);
+    Serial.println(" bytes)");
+    localAnnouncePending = false;
+    localAnnounceSent = true;
+    lastLocalAnnounceSentAt = millis();
+    return true;
+  }
+
+  Serial.print("FAILED (");
+  Serial.print(written);
+  Serial.print(" / ");
+  Serial.print(packetLength);
+  Serial.println(" bytes)");
+  return false;
+}
+
+void serviceLocalAnnounce()
+{
+  if (!bitchatLinkReady || !clockSynced || !localIdentity.ready)
+  {
+    return;
+  }
+
+  uint32_t now = millis();
+  bool periodicDue =
+    localAnnounceSent &&
+    now - lastLocalAnnounceSentAt >= ANNOUNCE_INTERVAL_MS;
+
+  if (!localAnnouncePending && !periodicDue)
+  {
+    return;
+  }
+
+  if (now - lastLocalAnnounceAttemptAt < ANNOUNCE_RETRY_MS)
+  {
+    return;
+  }
+
+  lastLocalAnnounceAttemptAt = now;
+  sendLocalAnnounce();
 }
 
 bool parseAnnouncePayload(
@@ -597,6 +1089,7 @@ void parse_bitchat_packet(const uint8_t* data, size_t len)
   uint8_t announceNoisePublicKey[32];
   uint8_t announceSigningPublicKey[32];
   bool announceFieldsValid = false;
+  bool announceIdentityValid = false;
 
   if (flags & 0x02)
   {
@@ -676,7 +1169,10 @@ void parse_bitchat_packet(const uint8_t* data, size_t len)
 
     if (announceFieldsValid)
     {
-      verifyNoiseKeySenderId(senderId, announceNoisePublicKey);
+      announceIdentityValid = verifyNoiseKeySenderId(
+        senderId,
+        announceNoisePublicKey
+      );
     }
   }
 
@@ -705,12 +1201,18 @@ void parse_bitchat_packet(const uint8_t* data, size_t len)
     }
     else
     {
-      verifyBitchatSignature(
+      bool signatureValid = verifyBitchatSignature(
         data,
         signatureOffset,
         signature,
         announceSigningPublicKey
       );
+
+      if (signatureValid && announceIdentityValid)
+      {
+        synchronizeClock(readBE64(data + 3));
+        requestLocalAnnounce();
+      }
     }
   }
 }
@@ -956,6 +1458,21 @@ void setup()
   Serial.print("Ed25519 verifier: ");
   Serial.println(cryptoReady ? "READY" : "FAILED");
 
+  if (cryptoReady)
+  {
+    cryptoMutex = xSemaphoreCreateMutex();
+    if (cryptoMutex == NULL)
+    {
+      Serial.println("CryptoCell mutex: FAILED");
+      cryptoReady = false;
+    }
+  }
+
+  if (!initializeLocalIdentity())
+  {
+    Serial.println("Local Bitchat identity: FAILED");
+  }
+
   Bluefruit.setName("XIAO-Bitchat");
 
   // Register the client service and characteristic.
@@ -983,6 +1500,7 @@ void setup()
 
 void loop()
 {
+  serviceLocalAnnounce();
 }
 
 
@@ -1094,6 +1612,21 @@ void connect_callback(uint16_t conn_handle)
 
   Serial.println("FOUND");
 
+  bitchatCharacteristicProperties = bitchatChar.properties();
+  Serial.print("Characteristic properties: 0x");
+  if (bitchatCharacteristicProperties < 0x10) Serial.print('0');
+  Serial.println(bitchatCharacteristicProperties, HEX);
+
+  if (
+    !(bitchatCharacteristicProperties & CHR_PROPS_WRITE_WO_RESP) &&
+    !(bitchatCharacteristicProperties & CHR_PROPS_WRITE)
+  )
+  {
+    Serial.println("Characteristic is not writable");
+    Bluefruit.disconnect(conn_handle);
+    return;
+  }
+
   Serial.print("Enabling notifications... ");
 
   if (!bitchatChar.enableNotify())
@@ -1132,6 +1665,8 @@ void connect_callback(uint16_t conn_handle)
     Serial.println(connection->getMtu());
   }
 
+  bitchatLinkReady = true;
+  localAnnouncePending = true;
   Serial.println("Waiting for Bitchat packets...");
 }
 
@@ -1178,6 +1713,9 @@ void disconnect_callback(
   Serial.print("Reason: 0x");
   Serial.println(reason, HEX);
 
+  bitchatLinkReady = false;
+  bitchatCharacteristicProperties = 0;
+  localAnnouncePending = false;
   connecting = false;
 
   Serial.println("Scanning again...");
