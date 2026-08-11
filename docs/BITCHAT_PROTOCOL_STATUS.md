@@ -6,7 +6,9 @@ Last updated: 2026-08-11
 
 The XIAO nRF52840 can discover a Bitchat BLE peer, connect through GATT,
 subscribe to notifications, reassemble fragmented Bitchat packets, decode a
-version 1 `ANNOUNCE`, and verify its Ed25519 signature.
+version 1 `ANNOUNCE`, derive its sender ID from the Noise public key, and verify
+its Ed25519 signature. Valid sender-ID and signature results have both been
+observed on the XIAO hardware.
 
 The receiver path is substantially complete for uncompressed version 1
 announcements. Transmitting an announcement, appearing as a peer in the
@@ -239,8 +241,16 @@ Sender ID:      29-6F-2F-21-F2-88-95-43
 Result:         MATCH
 ```
 
-This check was performed off-device during development. The firmware does not
-currently calculate or enforce the Noise-key fingerprint.
+This check was first performed off-device during development. The firmware now
+calculates the SHA-256 digest with CryptoCell, prints its first eight bytes, and
+compares them with the packet sender ID:
+
+```text
+Derived Sender ID: 29-6F-2F-21-F2-88-95-43
+Sender ID verification: VALID
+```
+
+The on-device fingerprint check has been confirmed with a live announcement.
 
 ## Ed25519 Signature Verification
 
@@ -313,9 +323,9 @@ Noise-authenticated peer state must therefore remain distinct.
 | Fragment parsing | Complete | Correct 13-byte fragment header |
 | Fragment reassembly | Complete for one active assembly | Concurrent assemblies not supported |
 | Announcement TLV decoding | Complete | Required and current optional fields decoded |
-| Sender-ID fingerprint | Validated off-device | Not enforced by firmware |
+| Sender-ID fingerprint | Complete | `VALID` observed on the XIAO with a live announcement |
 | Signature extraction | Complete | Correct 64-byte location after payload |
-| Ed25519 verification | Implemented | Sample vector is valid; on-device result still needs confirmation |
+| Ed25519 verification | Complete | `VALID` observed on the XIAO with a live announcement |
 | Compressed payload decoding | Not implemented | Parser logs and skips compressed payloads |
 | Peer registry | Not implemented | No persistent verified-peer state |
 | ANNOUNCE transmission | Not implemented | Receiver only |
@@ -348,37 +358,31 @@ If BLE timing is affected, verification should move to a bounded work queue.
 
 - The captured three-fragment announcement reassembled to exactly 168 bytes.
 - The payload and complete-packet lengths match every decoded field.
-- The observed sender ID matches the Noise public-key SHA-256 prefix.
+- The observed sender ID matches the Noise public-key SHA-256 prefix both
+  independently and on the XIAO hardware.
 - The captured Ed25519 signature validates against the reconstructed 256-byte
-  canonical signing data.
+  canonical signing data both independently and on the XIAO hardware.
 - The source passes `git diff --check`.
 - The sketch passes a C++11 syntax check with the XIAO nRF52840 ARM compiler.
 - Object generation with the XIAO toolchain succeeded.
 - The linked Adafruit nRFCrypto archive exports `CRYS_ECEDW_Verify`.
 
-A complete Arduino build, upload, and on-device signature result have not been
-run from this workspace because Arduino CLI is not installed. The firmware must
-still be flashed and the expected `Signature verification: VALID` line observed.
+The verification firmware was built and uploaded through the user's Arduino
+environment. `Sender ID verification: VALID` and `Signature verification:
+VALID (signed data: 256 bytes)` were both observed for the same live
+announcement. Arduino CLI is not installed in this workspace, so builds here
+use the board package's ARM compiler for syntax and object checks.
 
 ## Next Steps
 
-### Immediate Validation
-
-1. Build and upload the current sketch from Arduino IDE.
-2. Confirm `Ed25519 verifier: READY` at startup.
-3. Capture one complete announcement.
-4. Confirm `Signature verification: VALID`.
-5. Record any CryptoCell error code if verification fails.
-
 ### Receiver Hardening
 
-1. Add the Noise public-key SHA-256 sender-ID check to the firmware.
-2. Introduce a peer registry with parsed, signature-verified, and
+1. Introduce a peer registry with parsed, signature-verified, and
    Noise-authenticated states.
-3. Replace the single fragment assembly with a bounded table keyed by sender ID
+2. Replace the single fragment assembly with a bounded table keyed by sender ID
    and fragment ID.
-4. Add compressed-payload support if observed traffic requires it.
-5. Add replay and timestamp policy before treating announcements as trusted
+3. Add compressed-payload support if observed traffic requires it.
+4. Add replay and timestamp policy before treating announcements as trusted
    presence.
 
 ### Transmit and Session Phase
@@ -405,4 +409,3 @@ the upstream project is active.
 - [Outbound fragment format](https://github.com/permissionlesstech/bitchat/blob/main/bitchat/Services/BLE/BLEOutboundFragmentPlanner.swift)
 - [Inbound fragment parsing](https://github.com/permissionlesstech/bitchat/blob/main/bitchat/Services/BLE/BLEFragmentAssemblyBuffer.swift)
 - [Protocol whitepaper](https://github.com/permissionlesstech/bitchat/blob/main/WHITEPAPER.md)
-

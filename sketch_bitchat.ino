@@ -303,9 +303,52 @@ void verifyBitchatSignature(
   Serial.println(")");
 }
 
+void verifyNoiseKeySenderId(
+  const uint8_t* senderId,
+  uint8_t* noisePublicKey
+)
+{
+  Serial.print("Derived Sender ID: ");
+
+  if (!cryptoReady)
+  {
+    Serial.println("UNAVAILABLE");
+    Serial.println("Sender ID verification: UNAVAILABLE");
+    return;
+  }
+
+  static nRFCrypto_Hash hash;
+  uint8_t digest[64];
+
+  if (
+    !hash.begin(CRYS_HASH_SHA256_mode) ||
+    !hash.update(noisePublicKey, 32)
+  )
+  {
+    Serial.println("HASH ERROR");
+    Serial.println("Sender ID verification: ERROR");
+    return;
+  }
+
+  uint8_t digestLength = hash.end(digest);
+  if (digestLength != 32)
+  {
+    Serial.println("HASH ERROR");
+    Serial.println("Sender ID verification: ERROR");
+    return;
+  }
+
+  printHex(digest, 8);
+  Serial.println();
+
+  Serial.print("Sender ID verification: ");
+  Serial.println(memcmp(senderId, digest, 8) == 0 ? "VALID" : "INVALID");
+}
+
 bool parseAnnouncePayload(
   const uint8_t* payload,
   size_t payloadLength,
+  uint8_t* noisePublicKey,
   uint8_t* signingPublicKey
 )
 {
@@ -314,6 +357,7 @@ bool parseAnnouncePayload(
   bool hasSigningPublicKey = false;
   size_t offset = 0;
 
+  memset(noisePublicKey, 0, 32);
   memset(signingPublicKey, 0, 32);
 
   Serial.println("--- ANNOUNCE PAYLOAD ---");
@@ -350,6 +394,10 @@ bool parseAnnouncePayload(
         printHex(value, tlvLength);
         Serial.println();
         hasNoisePublicKey = tlvLength == 32;
+        if (hasNoisePublicKey)
+        {
+          memcpy(noisePublicKey, value, 32);
+        }
         break;
 
       case 0x03:
@@ -546,6 +594,7 @@ void parse_bitchat_packet(const uint8_t* data, size_t len)
   size_t packetEnd = payloadOffset + payloadLength;
   size_t signatureOffset = packetEnd;
   const uint8_t* signature = NULL;
+  uint8_t announceNoisePublicKey[32];
   uint8_t announceSigningPublicKey[32];
   bool announceFieldsValid = false;
 
@@ -621,8 +670,14 @@ void parse_bitchat_packet(const uint8_t* data, size_t len)
     announceFieldsValid = parseAnnouncePayload(
       payload,
       payloadLength,
+      announceNoisePublicKey,
       announceSigningPublicKey
     );
+
+    if (announceFieldsValid)
+    {
+      verifyNoiseKeySenderId(senderId, announceNoisePublicKey);
+    }
   }
 
   if (signature != NULL)
