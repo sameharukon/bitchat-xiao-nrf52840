@@ -1,6 +1,6 @@
 # Bitchat BLE Peer: Design and Implementation Status
 
-Last updated: 2026-08-11
+Last updated: 2026-10-12
 
 ## Status Summary
 
@@ -20,8 +20,14 @@ the XIAO sender ID as a direct neighbor and sent a directed, signed
 `REQUEST_SYNC`. Request decoding, authentication, GCS membership checking, and
 the no-response path for a present GCS member have been verified on-device. A
 one-shot forced-missing test also verified the queued TTL-zero RSR announcement
-response through a successful 168-byte GATT write. The BLE peripheral role,
-the Noise XX handshake, and message exchange have not been implemented yet.
+response through a successful 168-byte GATT write.
+
+Public `MESSAGE` reception is now implemented: signed messages from the
+active-link verified peer are authenticated, checked for freshness and
+duplicates, validated as UTF-8, and displayed on the serial console. The
+acceptance matrix passes in a host test harness; live capture and on-device
+verification are still pending. The BLE peripheral role, the Noise XX
+handshake, and message transmission have not been implemented yet.
 
 ## Current Data Flow
 
@@ -44,6 +50,10 @@ flowchart LR
     E --> O[Directed REQUEST_SYNC]
     O --> P[Peer signature and GCS validation]
     P --> Q[Queued TTL 0 RSR ANNOUNCE response]
+    E --> R[Public MESSAGE 0x02]
+    R --> S[Verified sender, freshness, and duplicate checks]
+    S --> T[Ed25519 verification and UTF-8 validation]
+    T --> U[Serial display]
 ```
 
 The implementation uses static buffers and does not allocate packet storage on
@@ -539,7 +549,8 @@ use the actual GCS membership result.
 | REQUEST_SYNC authentication | Complete | Local recipient and Ed25519 signature both reported `VALID` on-device |
 | REQUEST_SYNC GCS membership | Complete for present-member path | Packet ID calculated and `PRESENT` observed on-device |
 | REQUEST_SYNC RSR response | Complete | TTL 0, flag `0x12`, and 168-byte GATT write observed on-device |
-| Public MESSAGE receive and display | Next milestone | Signed UTF-8 payload handling is planned before Noise work |
+| Public MESSAGE receive and display | Implemented; hardware test pending | Passes the host acceptance matrix; live capture not yet recorded |
+| Public MESSAGE duplicate suppression | Implemented | 64-entry ring of authenticated 16-byte packet IDs |
 | BLE peripheral role | Not implemented | Not required for the first central-role transmission test |
 | Noise XX handshake | Not implemented | Required for authenticated private communication |
 | Message transmission | Not implemented | Depends on peer presence and Noise work |
@@ -555,12 +566,21 @@ MAX_REASSEMBLED    = 8192
 MAX_SIGNING_DATA   = 2048
 MAX_ANNOUNCE_PACKET = 256
 MAX_REQUEST_SYNC_GCS = 1024
+MAX_NICKNAME_BYTES = 255
+SEEN_PUBLIC_MESSAGE_RING_SIZE = 64
 ```
 
 The current fragment storage reserves approximately 7.7 KiB, and the signing
 verification buffer reserves 2 KiB. This is acceptable on the XIAO nRF52840,
 but a multi-peer assembly table should allocate entries deliberately rather
-than multiplying the current structure without a memory budget.
+than multiplying the current structure without a memory budget. The public
+message duplicate ring reserves 1 KiB.
+
+Because the canonical signing representation is limited to
+`MAX_SIGNING_DATA`, a public message is accepted only when its unsigned
+version 1 packet is at most 2048 bytes, which allows a payload of up to 2026
+bytes. Larger, fragmented messages are reassembled but rejected before display
+because their signature cannot be verified.
 
 Signature verification runs synchronously in the notification processing path.
 CryptoCell acceleration keeps the operation small, and announcements are
@@ -597,6 +617,11 @@ Arduino loop. Lock acquisition has a one-second timeout and fails closed.
   the installed LittleFS and internal-filesystem headers.
 - First-boot creation and reboot loading of the identity record have not yet
   been confirmed on the XIAO hardware.
+- The public `MESSAGE` path passes 22 host-side test cases (see
+  [Host Test Harness](#host-test-harness)), including signed ASCII, Japanese
+  and emoji text, duplicate suppression, invalid and missing signatures,
+  spoofed sender IDs, stale messages, fragmented long text, invalid UTF-8,
+  and terminal-control escaping.
 - The source passes `git diff --check`.
 - The sketch passes a C++11 syntax check with the XIAO nRF52840 ARM compiler.
 - Object generation with the XIAO toolchain succeeded.
@@ -614,10 +639,18 @@ object checks.
 
 ## Immediate Milestone: Public MESSAGE Receive and Display
 
-The next implementation target is deliberately limited to displaying a signed
-public `MESSAGE` (`0x02`) from the iPhone on the XIAO serial console. Public
-transmission, the BLE peripheral role, Noise, private messages, group-message
-decryption, and media are out of scope until this milestone passes.
+The current implementation target is deliberately limited to displaying a
+signed public `MESSAGE` (`0x02`) from the iPhone on the XIAO serial console.
+Public transmission, the BLE peripheral role, Noise, private messages,
+group-message decryption, and media are out of scope until this milestone
+passes.
+
+| Phase | Status |
+| --- | --- |
+| 1. Capture the wire sample | Pending; requires a live iPhone capture |
+| 2. Authenticate and decode | Implemented; host tests pass |
+| 3. Acceptance policy | Implemented; host tests pass |
+| 4. Hardware test matrix | Pending on the XIAO |
 
 The current official implementation treats a public `MESSAGE` packet payload
 as UTF-8 text directly. It does not use the larger binary `BitchatMessage`
@@ -636,6 +669,10 @@ verified announcement.
 Exit criterion: one complete live public-message packet is accounted for byte
 by byte.
 
+The firmware already logs every received chunk, the decoded header, the
+packet ID, and the signature, so a normal serial capture is sufficient for
+this phase.
+
 ### Phase 2: Authenticate and Decode
 
 1. Add a `MESSAGE` branch to the packet parser.
@@ -646,19 +683,59 @@ by byte.
 5. Validate the complete payload as UTF-8 before printing it.
 6. Print sender nickname, sender ID, timestamp, TTL, byte length, and content.
 
-Expected output:
+Expected output, as produced by the host harness with a synthetic peer key:
 
 ```text
+--- PUBLIC MESSAGE VALIDATION ---
+Packet ID: 4E-BA-8E-FF-64-7A-67-8D-23-52-9D-91-91-78-74-E7
+Signature verification: VALID (signed data: 256 bytes)
+
 --- PUBLIC MESSAGE ---
 Sender: anon8168
-Sender ID: 29-6F-2F-21-F2-88-95-43
-Timestamp (ms): ...
+Sender ID: A1-04-C5-D5-F7-86-DE-DD
+Timestamp (ms): 1786423286123 (2026-08-11T04:41:26.123Z)
+TTL: 7
+Length: 10 bytes
 Signature verification: VALID
 Content: hello xiao
 ```
 
 Exit criterion: a correctly signed message is displayed, while a missing or
 invalid signature never reaches the content log.
+
+### Implemented Acceptance Order
+
+`handlePublicMessagePacket()` applies the checks below in order. Every
+rejection prints a reason and never prints the payload.
+
+1. Reject a packet whose sender ID is the local identity. A copy with a
+   non-zero TTL is a self echo; a TTL-zero copy cannot be a solicited sync
+   response because the XIAO does not transmit public messages yet.
+2. Accept a missing or all-`0xFF` recipient as broadcast, and a recipient equal
+   to the local sender ID as directed. Reject any other recipient.
+3. Reject compressed payloads.
+4. Require a signature and a signing key from the active-link verified peer
+   cache. The cached nickname from that verified announcement is used as the
+   display name.
+5. Require the synchronized clock and, for broadcast messages only, reject a
+   timestamp more than six hours old. This matches upstream
+   `BLEPublicMessagePolicy` and `syncPublicMessageMaxAgeSeconds`.
+6. Compute the official 16-byte packet ID and suppress it if it is already in
+   the duplicate ring. TTL is not part of the ID, so relayed copies are also
+   suppressed.
+7. Verify the Ed25519 signature over the canonical signing representation.
+8. Insert the packet ID into the duplicate ring. Only authenticated packets are
+   inserted, so a forged copy cannot suppress the genuine message.
+9. Require strict UTF-8, rejecting overlong forms, surrogates, and code points
+   above U+10FFFF.
+10. Display the message. C0 and C1 control characters, `DEL`, and Unicode
+    bidirectional formatting characters are printed as escapes, and a
+    backslash is doubled, so peer text cannot move the cursor or reorder the
+    log. Valid UTF-8 nicknames use the same escaping.
+
+The duplicate ring survives reconnects so that sync re-delivery after a
+reconnect is not printed twice. The verified peer cache is still cleared on
+disconnect, so messages are rejected until the peer announces again.
 
 ### Phase 3: Acceptance Policy
 
@@ -686,6 +763,28 @@ logged as rejected without printing attacker-controlled content.
 
 Completion criterion: all applicable cases pass on the XIAO, with the captured
 serial evidence added to this document.
+
+Every case in this matrix currently passes in the host test harness. The
+harness additionally covers altered content, a spoofed sender ID with a
+different signing key, an explicit all-`0xFF` broadcast recipient, a message
+addressed to another peer, a self echo, compressed payloads, and clearing of
+the verified peer cache on disconnect.
+
+### Host Test Harness
+
+[`tests/host`](../tests/host) compiles the unmodified sketch on a development
+machine against stub Arduino, Bluefruit, FreeRTOS, and LittleFS headers. The
+CryptoCell SHA-256, Ed25519, and X25519 calls are implemented with OpenSSL. The
+test signs packets with an independent implementation of the canonical
+signing representation and feeds them through `parse_bitchat_packet()`.
+
+```sh
+tests/host/run.sh
+```
+
+The script requires a C++17 compiler and the OpenSSL 3 development headers.
+The harness exercises protocol logic only; BLE timing, CryptoCell behavior,
+and serial throughput must still be verified on the XIAO.
 
 ## Deferred Work After Public Receive
 

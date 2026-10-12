@@ -11,11 +11,14 @@ validates peer announcements, and advertises the XIAO back to the app as
 The official iPhone app has displayed the XIAO as a peer, included its sender
 ID in a direct-neighbor announcement, and sent it authenticated
 `REQUEST_SYNC` packets. Signed, GCS-aware RSR announcement responses have also
-been transmitted successfully from the XIAO.
+been transmitted successfully from the XIAO. Signed public messages from the
+verified peer are authenticated and displayed on the serial console; this path
+passes a host-side test harness and is awaiting on-device verification.
 
 > [!WARNING]
 > This is protocol research firmware, not a production Bitchat client. It does
-> not yet implement Noise sessions or private messaging. Do not rely on it for
+> not yet implement Noise sessions, private messaging, or message
+> transmission. Do not rely on it for
 > confidential or safety-critical communication.
 
 ## Current Status
@@ -34,7 +37,7 @@ been transmitted successfully from the XIAO.
 | Signed local announcement transmission | Accepted by the official iPhone app |
 | Directed `REQUEST_SYNC` authentication and GCS decoding | Verified on hardware |
 | TTL-zero RSR announcement response | Verified with a 168-byte GATT write |
-| Public `MESSAGE` receive and display | Next milestone |
+| Public `MESSAGE` receive and display | Implemented; host tests pass, hardware test pending |
 | Noise XX and private messaging | Not implemented |
 
 See [the protocol and implementation status](docs/BITCHAT_PROTOCOL_STATUS.md)
@@ -110,24 +113,50 @@ BLE scan
   -> persistent local identity
   -> signed local announcement
   -> authenticated REQUEST_SYNC and RSR handling
+  -> authenticated public MESSAGE display
 ```
 
 Packet storage uses static buffers rather than heap allocation. Inbound and
 outbound CryptoCell operations share a FreeRTOS mutex, and GATT writes queued
 from notification handling are performed by the Arduino loop.
 
+## Public Messages
+
+When the connected iPhone sends a public message, the XIAO prints it after the
+following checks pass:
+
+1. The sender has a sender-ID-checked, signature-verified announcement on the
+   active link.
+2. The packet is broadcast, or directed to the XIAO, and is not compressed.
+3. A broadcast message is no more than six hours old, matching upstream.
+4. The packet ID has not already been displayed.
+5. The Ed25519 signature is valid.
+6. The payload is valid UTF-8.
+
+```text
+--- PUBLIC MESSAGE ---
+Sender: anon8168
+Sender ID: 29-6F-2F-21-F2-88-95-43
+Timestamp (ms): 1786423286123 (2026-08-11T04:41:26.123Z)
+TTL: 7
+Length: 10 bytes
+Signature verification: VALID
+Content: hello xiao
+```
+
+Control characters and Unicode bidirectional formatting characters in peer
+text are printed as escapes such as `\x1B` or `\u{202E}`.
+
 ## Immediate Development Goal
 
-The next milestone is secure public-message reception and serial display:
+Public-message reception is implemented and passes the host test harness. The
+remaining milestone work requires hardware:
 
-1. Capture a live public `MESSAGE` (`0x02`) from the iPhone.
-2. Authenticate it with the signing key from the peer's verified announcement.
-3. Validate the payload as UTF-8.
-4. Display the sender, timestamp, and text.
-5. Add bounded duplicate suppression and the upstream six-hour freshness
-   policy.
-6. Verify ASCII, Japanese, emoji, invalid-signature, duplicate, and fragmented
-   long-message cases on hardware.
+1. Capture a live public `MESSAGE` (`0x02`) from the iPhone and account for it
+   byte by byte.
+2. Verify ASCII, Japanese, emoji, invalid-signature, duplicate, stale, and
+   fragmented long-message cases on the XIAO.
+3. Record the serial evidence in the protocol status document.
 
 Noise, private messages, public-message transmission, and the BLE peripheral
 role are intentionally deferred until public receive passes this test matrix.
@@ -154,6 +183,10 @@ Set it to `1` only for a one-shot RSR response-path test, then return it to
 
 - The XIAO currently operates as a BLE central only.
 - Only one fragment assembly and one active-link verified peer are retained.
+  Public messages from peers that have not announced on the active link are
+  rejected.
+- Public messages whose unsigned packet exceeds 2048 bytes (a payload above
+  2026 bytes) are rejected because their signature cannot be verified.
 - Version 2 parsing is partial and has not been fully exercised.
 - Compressed payloads are not decoded.
 - Noise XX, encrypted private messages, group sessions, files, and media are
@@ -172,7 +205,21 @@ Set it to `1` only for a one-shot RSR response-path test, then return it to
 ```text
 sketch_bitchat.ino                 Main Arduino firmware
 docs/BITCHAT_PROTOCOL_STATUS.md    Protocol notes, status, evidence, roadmap
+tests/host/                        Host-side protocol tests with stub headers
 ```
+
+## Host Tests
+
+The public-message logic can be tested without hardware. The script compiles
+the sketch against stub board headers, using OpenSSL for SHA-256, Ed25519, and
+X25519:
+
+```sh
+tests/host/run.sh
+```
+
+It requires a C++17 compiler and the OpenSSL 3 development headers. BLE
+behavior and CryptoCell timing still need to be verified on the XIAO.
 
 ## Upstream Compatibility
 

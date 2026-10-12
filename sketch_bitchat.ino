@@ -13,6 +13,8 @@ using namespace Adafruit_LittleFS_Namespace;
 #define MAX_SIGNING_DATA   2048
 #define MAX_ANNOUNCE_PACKET 256
 #define MAX_REQUEST_SYNC_GCS 1024
+#define MAX_NICKNAME_BYTES 255
+#define SEEN_PUBLIC_MESSAGE_RING_SIZE 64
 #define IDENTITY_RECORD_DATA_SIZE 72
 #define IDENTITY_RECORD_SIZE 104
 
@@ -24,6 +26,8 @@ static const uint32_t ANNOUNCE_INTERVAL_MS = 20000;
 static const uint32_t ANNOUNCE_RETRY_MS = 1000;
 static const uint32_t REQUEST_SYNC_RESPONSE_WINDOW_MS = 30000;
 static const uint8_t REQUEST_SYNC_RESPONSE_LIMIT = 8;
+// Matches the upstream public-message acceptance and gossip-sync window.
+static const uint64_t PUBLIC_MESSAGE_MAX_AGE_MS = 6ULL * 60 * 60 * 1000;
 static const char IDENTITY_FILE_PATH[] = "/bitchat_identity.bin";
 static const char IDENTITY_TEMP_FILE_PATH[] = "/bitchat_identity.tmp";
 static const uint8_t IDENTITY_RECORD_MAGIC[4] = {
@@ -46,6 +50,8 @@ struct VerifiedPeerIdentity
   bool ready;
   uint8_t senderId[8];
   uint8_t signingPublicKey[32];
+  uint8_t nickname[MAX_NICKNAME_BYTES];
+  uint8_t nicknameLength;
 };
 
 struct RequestSyncPayload
@@ -79,6 +85,13 @@ struct FragmentAssembly
 };
 
 FragmentAssembly fragmentAssembly;
+
+// Packet IDs of public messages that passed authentication. Only accessed from
+// the notification processing path, like the fragment assembly.
+uint8_t seenPublicMessageIds[SEEN_PUBLIC_MESSAGE_RING_SIZE][16];
+uint8_t seenPublicMessageCount = 0;
+uint8_t seenPublicMessageNext = 0;
+
 LocalIdentity localIdentity;
 VerifiedPeerIdentity verifiedPeer;
 SemaphoreHandle_t cryptoMutex = NULL;
@@ -333,7 +346,12 @@ size_t signingDataLengthWithPadding(size_t unpaddedLength)
   return unpaddedLength;
 }
 
-bool calculateSha256(const uint8_t* data, size_t length, uint8_t* digest)
+bool calculateSha256Parts(
+  const uint8_t* const* parts,
+  const size_t* lengths,
+  size_t partCount,
+  uint8_t* digest
+)
 {
   static nRFCrypto_Hash hash;
 
@@ -345,18 +363,30 @@ bool calculateSha256(const uint8_t* data, size_t length, uint8_t* digest)
     return false;
   }
 
-  bool success = false;
-  if (
-    hash.begin(CRYS_HASH_SHA256_mode) &&
+  bool success = hash.begin(CRYS_HASH_SHA256_mode);
+  for (size_t i = 0; success && i < partCount; i++)
+  {
+    if (lengths[i] == 0)
+    {
+      continue;
+    }
+
     // The nRFCrypto API does not mark the input as const but does not modify it.
-    hash.update(const_cast<uint8_t*>(data), length)
-  )
+    success = hash.update(const_cast<uint8_t*>(parts[i]), lengths[i]);
+  }
+
+  if (success)
   {
     success = hash.end(digest) == 32;
   }
 
   xSemaphoreGive(cryptoMutex);
   return success;
+}
+
+bool calculateSha256(const uint8_t* data, size_t length, uint8_t* digest)
+{
+  return calculateSha256Parts(&data, &length, 1, digest);
 }
 
 bool takeCryptoMutex()
@@ -857,7 +887,9 @@ bool takeProtocolStateMutex()
 
 void rememberVerifiedPeer(
   const uint8_t* senderId,
-  const uint8_t* signingPublicKey
+  const uint8_t* signingPublicKey,
+  const uint8_t* nickname,
+  uint8_t nicknameLength
 )
 {
   if (!takeProtocolStateMutex())
@@ -868,15 +900,19 @@ void rememberVerifiedPeer(
 
   memcpy(verifiedPeer.senderId, senderId, 8);
   memcpy(verifiedPeer.signingPublicKey, signingPublicKey, 32);
+  memcpy(verifiedPeer.nickname, nickname, nicknameLength);
+  verifiedPeer.nicknameLength = nicknameLength;
   verifiedPeer.ready = true;
   xSemaphoreGive(protocolStateMutex);
 
   Serial.println("Verified peer cache: UPDATED");
 }
 
-bool getVerifiedPeerSigningKey(
+bool getVerifiedPeer(
   const uint8_t* senderId,
-  uint8_t* signingPublicKey
+  uint8_t* signingPublicKey,
+  uint8_t* nickname,
+  uint8_t* nicknameLength
 )
 {
   if (!takeProtocolStateMutex())
@@ -889,10 +925,24 @@ bool getVerifiedPeerSigningKey(
   if (found)
   {
     memcpy(signingPublicKey, verifiedPeer.signingPublicKey, 32);
+
+    if (nickname != NULL && nicknameLength != NULL)
+    {
+      memcpy(nickname, verifiedPeer.nickname, verifiedPeer.nicknameLength);
+      *nicknameLength = verifiedPeer.nicknameLength;
+    }
   }
 
   xSemaphoreGive(protocolStateMutex);
   return found;
+}
+
+bool getVerifiedPeerSigningKey(
+  const uint8_t* senderId,
+  uint8_t* signingPublicKey
+)
+{
+  return getVerifiedPeer(senderId, signingPublicKey, NULL, NULL);
 }
 
 void cacheLocalAnnouncePacket(const uint8_t* packet, size_t packetLength)
@@ -934,6 +984,30 @@ bool getCachedLocalAnnouncePacket(uint8_t* packet, size_t* packetLength)
   return available;
 }
 
+// Official packet ID: SHA-256 prefix over type | sender ID | timestamp | payload.
+bool calculatePacketIdFromFields(
+  const uint8_t* type,
+  const uint8_t* senderId,
+  const uint8_t* timestamp,
+  const uint8_t* payload,
+  size_t payloadLength,
+  uint8_t* packetId
+)
+{
+  const uint8_t* parts[] = { type, senderId, timestamp, payload };
+  size_t lengths[] = { 1, 8, 8, payloadLength };
+
+  uint8_t digest[64];
+  bool success = calculateSha256Parts(parts, lengths, 4, digest);
+  if (success)
+  {
+    memcpy(packetId, digest, 16);
+  }
+
+  secureZero(digest, sizeof(digest));
+  return success;
+}
+
 bool calculatePacketId(
   const uint8_t* packet,
   size_t packetLength,
@@ -952,34 +1026,19 @@ bool calculatePacketId(
     payloadOffset += 8;
   }
 
-  if (
-    payloadOffset + payloadLength > packetLength ||
-    payloadLength > 128
-  )
+  if (payloadOffset + payloadLength > packetLength)
   {
     return false;
   }
 
-  uint8_t idInput[1 + 8 + 8 + 128];
-  size_t idInputLength = 0;
-  idInput[idInputLength++] = packet[1];
-  memcpy(idInput + idInputLength, packet + 14, 8);
-  idInputLength += 8;
-  memcpy(idInput + idInputLength, packet + 3, 8);
-  idInputLength += 8;
-  memcpy(idInput + idInputLength, packet + payloadOffset, payloadLength);
-  idInputLength += payloadLength;
-
-  uint8_t digest[64];
-  bool success = calculateSha256(idInput, idInputLength, digest);
-  if (success)
-  {
-    memcpy(packetId, digest, 16);
-  }
-
-  secureZero(idInput, sizeof(idInput));
-  secureZero(digest, sizeof(digest));
-  return success;
+  return calculatePacketIdFromFields(
+    packet + 1,
+    packet + 14,
+    packet + 3,
+    packet + payloadOffset,
+    payloadLength,
+    packetId
+  );
 }
 
 bool readGcsBit(
@@ -1798,11 +1857,388 @@ void handleRequestSyncPacket(
   Serial.println("REQUEST_SYNC response: RSR ANNOUNCE QUEUED");
 }
 
+// Strict UTF-8 validation: rejects overlong forms, surrogates, and code points
+// above U+10FFFF, matching what Foundation accepts as UTF-8 text.
+bool isValidUtf8(const uint8_t* data, size_t length)
+{
+  size_t i = 0;
+
+  while (i < length)
+  {
+    uint8_t lead = data[i];
+    size_t continuationCount;
+    uint8_t minSecond = 0x80;
+    uint8_t maxSecond = 0xBF;
+
+    if (lead <= 0x7F)
+    {
+      i++;
+      continue;
+    }
+    else if (lead >= 0xC2 && lead <= 0xDF)
+    {
+      continuationCount = 1;
+    }
+    else if (lead >= 0xE0 && lead <= 0xEF)
+    {
+      continuationCount = 2;
+      if (lead == 0xE0) minSecond = 0xA0;
+      if (lead == 0xED) maxSecond = 0x9F;
+    }
+    else if (lead >= 0xF0 && lead <= 0xF4)
+    {
+      continuationCount = 3;
+      if (lead == 0xF0) minSecond = 0x90;
+      if (lead == 0xF4) maxSecond = 0x8F;
+    }
+    else
+    {
+      return false;
+    }
+
+    if (continuationCount > length - i - 1)
+    {
+      return false;
+    }
+
+    if (data[i + 1] < minSecond || data[i + 1] > maxSecond)
+    {
+      return false;
+    }
+
+    for (size_t j = 2; j <= continuationCount; j++)
+    {
+      if ((data[i + j] & 0xC0) != 0x80)
+      {
+        return false;
+      }
+    }
+
+    i += continuationCount + 1;
+  }
+
+  return true;
+}
+
+void printEscapedCodePoint(uint32_t codePoint)
+{
+  Serial.print("\\u{");
+  Serial.print(codePoint, HEX);
+  Serial.print('}');
+}
+
+// Prints validated UTF-8 text. Control and bidirectional formatting characters
+// are escaped so that peer-supplied text cannot alter the terminal or the
+// visual order of the log.
+void printSafeUtf8(const uint8_t* data, size_t length)
+{
+  size_t i = 0;
+
+  while (i < length)
+  {
+    uint8_t lead = data[i];
+
+    if (lead < 0x80)
+    {
+      if (lead == '\\')
+      {
+        Serial.print("\\\\");
+      }
+      else if (lead < 0x20 || lead == 0x7F)
+      {
+        Serial.print("\\x");
+        if (lead < 0x10) Serial.print('0');
+        Serial.print(lead, HEX);
+      }
+      else
+      {
+        Serial.write(lead);
+      }
+
+      i++;
+      continue;
+    }
+
+    size_t sequenceLength = lead >= 0xF0 ? 4 : (lead >= 0xE0 ? 3 : 2);
+    uint32_t codePoint = lead & (0x7F >> sequenceLength);
+    for (size_t j = 1; j < sequenceLength; j++)
+    {
+      codePoint = (codePoint << 6) | (data[i + j] & 0x3F);
+    }
+
+    bool escape =
+      (codePoint >= 0x80 && codePoint <= 0x9F) ||
+      codePoint == 0x061C ||
+      codePoint == 0x200E ||
+      codePoint == 0x200F ||
+      (codePoint >= 0x2028 && codePoint <= 0x202E) ||
+      (codePoint >= 0x2066 && codePoint <= 0x2069);
+
+    if (escape)
+    {
+      printEscapedCodePoint(codePoint);
+    }
+    else
+    {
+      Serial.write(data + i, sequenceLength);
+    }
+
+    i += sequenceLength;
+  }
+}
+
+void printPeerText(const uint8_t* data, size_t length)
+{
+  if (isValidUtf8(data, length))
+  {
+    printSafeUtf8(data, length);
+  }
+  else
+  {
+    printText(data, length);
+  }
+}
+
+void printUtcTimestamp(uint64_t epochMilliseconds)
+{
+  uint64_t totalSeconds = epochMilliseconds / 1000;
+  uint16_t milliseconds = (uint16_t)(epochMilliseconds % 1000);
+  uint32_t secondOfDay = (uint32_t)(totalSeconds % 86400);
+  int64_t days = (int64_t)(totalSeconds / 86400);
+
+  // Civil date from days since 1970-01-01 (proleptic Gregorian calendar).
+  days += 719468;
+  int64_t era = days / 146097;
+  uint32_t dayOfEra = (uint32_t)(days - era * 146097);
+  uint32_t yearOfEra =
+    (dayOfEra - dayOfEra / 1460 + dayOfEra / 36524 - dayOfEra / 146096) / 365;
+  int64_t year = (int64_t)yearOfEra + era * 400;
+  uint32_t dayOfYear =
+    dayOfEra - (365 * yearOfEra + yearOfEra / 4 - yearOfEra / 100);
+  uint32_t monthIndex = (5 * dayOfYear + 2) / 153;
+  uint32_t day = dayOfYear - (153 * monthIndex + 2) / 5 + 1;
+  uint32_t month = monthIndex < 10 ? monthIndex + 3 : monthIndex - 9;
+  if (month <= 2) year++;
+
+  char buffer[64];
+  snprintf(
+    buffer,
+    sizeof(buffer),
+    "%04ld-%02lu-%02luT%02lu:%02lu:%02lu.%03uZ",
+    (long)year,
+    (unsigned long)month,
+    (unsigned long)day,
+    (unsigned long)(secondOfDay / 3600),
+    (unsigned long)((secondOfDay / 60) % 60),
+    (unsigned long)(secondOfDay % 60),
+    (unsigned)milliseconds
+  );
+  Serial.print(buffer);
+}
+
+bool isBroadcastRecipient(const uint8_t* recipientId)
+{
+  if (recipientId == NULL)
+  {
+    return true;
+  }
+
+  for (uint8_t i = 0; i < 8; i++)
+  {
+    if (recipientId[i] != 0xFF)
+    {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool publicMessageAlreadySeen(const uint8_t* packetId)
+{
+  for (uint8_t i = 0; i < seenPublicMessageCount; i++)
+  {
+    if (memcmp(seenPublicMessageIds[i], packetId, 16) == 0)
+    {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+void rememberPublicMessage(const uint8_t* packetId)
+{
+  memcpy(seenPublicMessageIds[seenPublicMessageNext], packetId, 16);
+  seenPublicMessageNext =
+    (seenPublicMessageNext + 1) % SEEN_PUBLIC_MESSAGE_RING_SIZE;
+
+  if (seenPublicMessageCount < SEEN_PUBLIC_MESSAGE_RING_SIZE)
+  {
+    seenPublicMessageCount++;
+  }
+}
+
+void handlePublicMessagePacket(
+  const uint8_t* packet,
+  size_t signatureOffset,
+  const uint8_t* signature,
+  uint8_t ttl,
+  uint8_t flags,
+  const uint8_t* senderId,
+  const uint8_t* recipientId,
+  const uint8_t* payload,
+  size_t payloadLength
+)
+{
+  Serial.println("--- PUBLIC MESSAGE VALIDATION ---");
+
+  if (localIdentity.ready && memcmp(senderId, localIdentity.senderId, 8) == 0)
+  {
+    // The XIAO does not transmit public messages yet, so no self-authored
+    // copy can be a solicited sync response.
+    Serial.println(
+      ttl != 0
+        ? "MESSAGE rejected: self echo"
+        : "MESSAGE rejected: unsolicited self-authored copy"
+    );
+    return;
+  }
+
+  bool broadcast = isBroadcastRecipient(recipientId);
+  if (
+    !broadcast &&
+    (!localIdentity.ready || memcmp(recipientId, localIdentity.senderId, 8) != 0)
+  )
+  {
+    Serial.println("MESSAGE rejected: addressed to another peer");
+    return;
+  }
+
+  if (flags & 0x04)
+  {
+    Serial.println("MESSAGE rejected: compressed payload unsupported");
+    return;
+  }
+
+  if (signature == NULL)
+  {
+    Serial.println("MESSAGE rejected: signature is missing");
+    return;
+  }
+
+  uint8_t signingPublicKey[32];
+  static uint8_t nickname[MAX_NICKNAME_BYTES];
+  uint8_t nicknameLength = 0;
+  if (!getVerifiedPeer(senderId, signingPublicKey, nickname, &nicknameLength))
+  {
+    Serial.println("MESSAGE rejected: sender has no verified ANNOUNCE");
+    return;
+  }
+
+  uint64_t timestamp = readBE64(packet + 3);
+  uint64_t now = 0;
+  if (!currentEpochMilliseconds(&now))
+  {
+    secureZero(signingPublicKey, sizeof(signingPublicKey));
+    Serial.println("MESSAGE rejected: clock is not synchronized");
+    return;
+  }
+
+  // Upstream applies the freshness window to broadcast messages only.
+  if (
+    broadcast &&
+    now >= PUBLIC_MESSAGE_MAX_AGE_MS &&
+    timestamp < now - PUBLIC_MESSAGE_MAX_AGE_MS
+  )
+  {
+    secureZero(signingPublicKey, sizeof(signingPublicKey));
+    Serial.print("MESSAGE rejected: stale broadcast (age: ");
+    printUInt64((now - timestamp) / 1000);
+    Serial.println(" s)");
+    return;
+  }
+
+  uint8_t packetId[16];
+  if (!calculatePacketIdFromFields(
+        packet + 1,
+        senderId,
+        packet + 3,
+        payload,
+        payloadLength,
+        packetId
+      ))
+  {
+    secureZero(signingPublicKey, sizeof(signingPublicKey));
+    Serial.println("MESSAGE rejected: packet ID calculation failed");
+    return;
+  }
+
+  Serial.print("Packet ID: ");
+  printHex(packetId, sizeof(packetId));
+  Serial.println();
+
+  // Lookup before verification avoids repeated CryptoCell work, while only
+  // authenticated packets are inserted so forged copies cannot poison the ring.
+  if (publicMessageAlreadySeen(packetId))
+  {
+    secureZero(signingPublicKey, sizeof(signingPublicKey));
+    Serial.println("MESSAGE suppressed: duplicate packet ID");
+    return;
+  }
+
+  bool signatureValid = verifyBitchatSignature(
+    packet,
+    signatureOffset,
+    signature,
+    signingPublicKey
+  );
+  secureZero(signingPublicKey, sizeof(signingPublicKey));
+  if (!signatureValid)
+  {
+    Serial.println("MESSAGE rejected: signature verification failed");
+    return;
+  }
+
+  rememberPublicMessage(packetId);
+
+  if (!isValidUtf8(payload, payloadLength))
+  {
+    Serial.println("MESSAGE rejected: payload is not valid UTF-8");
+    return;
+  }
+
+  Serial.println();
+  Serial.println(broadcast ? "--- PUBLIC MESSAGE ---" : "--- DIRECTED MESSAGE ---");
+  Serial.print("Sender: ");
+  printPeerText(nickname, nicknameLength);
+  Serial.println();
+  Serial.print("Sender ID: ");
+  printHex(senderId, 8);
+  Serial.println();
+  Serial.print("Timestamp (ms): ");
+  printUInt64(timestamp);
+  Serial.print(" (");
+  printUtcTimestamp(timestamp);
+  Serial.println(")");
+  Serial.print("TTL: ");
+  Serial.println(ttl);
+  Serial.print("Length: ");
+  Serial.print(payloadLength);
+  Serial.println(" bytes");
+  Serial.println("Signature verification: VALID");
+  Serial.print("Content: ");
+  printSafeUtf8(payload, payloadLength);
+  Serial.println();
+}
+
 bool parseAnnouncePayload(
   const uint8_t* payload,
   size_t payloadLength,
   uint8_t* noisePublicKey,
-  uint8_t* signingPublicKey
+  uint8_t* signingPublicKey,
+  uint8_t* nickname,
+  uint8_t* nicknameLength
 )
 {
   bool hasNickname = false;
@@ -1812,6 +2248,7 @@ bool parseAnnouncePayload(
 
   memset(noisePublicKey, 0, 32);
   memset(signingPublicKey, 0, 32);
+  *nicknameLength = 0;
 
   Serial.println("--- ANNOUNCE PAYLOAD ---");
 
@@ -1837,6 +2274,9 @@ bool parseAnnouncePayload(
         Serial.print("Nickname: ");
         printText(value, tlvLength);
         Serial.println();
+        // A one-byte TLV length always fits MAX_NICKNAME_BYTES.
+        memcpy(nickname, value, tlvLength);
+        *nicknameLength = tlvLength;
         hasNickname = true;
         break;
 
@@ -2051,6 +2491,8 @@ void parse_bitchat_packet(const uint8_t* data, size_t len)
   const uint8_t* signature = NULL;
   uint8_t announceNoisePublicKey[32];
   uint8_t announceSigningPublicKey[32];
+  static uint8_t announceNickname[MAX_NICKNAME_BYTES];
+  uint8_t announceNicknameLength = 0;
   bool announceFieldsValid = false;
   bool announceIdentityValid = false;
 
@@ -2127,7 +2569,9 @@ void parse_bitchat_packet(const uint8_t* data, size_t len)
       payload,
       payloadLength,
       announceNoisePublicKey,
-      announceSigningPublicKey
+      announceSigningPublicKey,
+      announceNickname,
+      &announceNicknameLength
     );
 
     if (announceFieldsValid)
@@ -2173,11 +2617,30 @@ void parse_bitchat_packet(const uint8_t* data, size_t len)
 
       if (signatureValid && announceIdentityValid)
       {
-        rememberVerifiedPeer(senderId, announceSigningPublicKey);
+        rememberVerifiedPeer(
+          senderId,
+          announceSigningPublicKey,
+          announceNickname,
+          announceNicknameLength
+        );
         synchronizeClock(readBE64(data + 3));
         requestLocalAnnounce();
       }
     }
+  }
+  else if (type == 0x02)
+  {
+    handlePublicMessagePacket(
+      data,
+      signatureOffset,
+      signature,
+      ttl,
+      flags,
+      senderId,
+      recipientId,
+      payload,
+      payloadLength
+    );
   }
   else if (type == 0x21)
   {
