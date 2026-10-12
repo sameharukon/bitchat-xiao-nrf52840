@@ -22,8 +22,8 @@ the no-response path for a present GCS member have been verified on-device. A
 one-shot forced-missing test also verified the queued TTL-zero RSR announcement
 response through a successful 168-byte GATT write.
 
-Public `MESSAGE` reception is now implemented: signed messages from the
-active-link verified peer are authenticated, checked for freshness and
+Public `MESSAGE` reception is now implemented: signed messages from peers in
+the verified registry are authenticated, checked for freshness and
 duplicates, validated as UTF-8, and displayed on the serial console. The
 acceptance matrix passes in a host test harness; live capture and on-device
 verification are still pending.
@@ -199,10 +199,12 @@ The assembly logic:
 - validates that the reassembled packet type matches the fragment metadata;
 - recursively sends the completed packet back through the normal parser.
 
-Current limitation: only one fragment assembly can be active at a time. A new
-fragment ID replaces the existing incomplete assembly. The assembly key also
-does not include the sender ID. Supporting multiple simultaneous peers will
-require an assembly table keyed by sender ID and fragment ID.
+Two assemblies can be active at once. Each is keyed by the fragment packet's
+sender ID and the fragment ID, so a relayed stream from another peer, even
+with a colliding fragment ID, does not discard the direct peer's assembly.
+A fragment for a new key takes a free or expired slot, or otherwise evicts the
+assembly that started first. A fragment whose original type is itself
+`FRAGMENT` is rejected rather than reassembled recursively.
 
 ## Announcement Payload
 
@@ -348,6 +350,26 @@ Possible failure output:
 Signature verification: INVALID (CryptoCell error: 0x...)
 ```
 
+### Verified Peer Registry
+
+Up to eight verified peers are kept in RAM, each with its sender ID, Ed25519
+signing key, and nickname. A new peer takes a free entry or evicts the peer
+whose announcement is least recent. Entries survive reconnects but not a
+reboot.
+
+The first verified signing key for a sender ID is pinned. A later
+announcement for the same sender ID that carries a different signing key is
+rejected even when its self-signature is valid:
+
+```text
+Verified peer cache: REJECTED (signing key differs from pinned key; possible impersonation)
+```
+
+This mirrors the trust-on-first-use rule in upstream
+`BLEAnnounceTrustPolicy`. Without it, anyone could pair a victim's public Noise
+key, and therefore its sender ID, with their own signing key and then forge
+messages and sync requests from that sender.
+
 ### Security Meaning
 
 A valid announcement signature proves possession of the private Ed25519 key
@@ -382,8 +404,13 @@ starts, the same seeds are loaded and the same sender ID and public keys should
 be derived.
 
 The board has no trusted wall clock. It accepts a timestamp as a clock source
-only after the incoming announcement has both a valid sender-ID fingerprint and
-a valid Ed25519 signature. The local clock then advances from `millis()`. A
+only after the incoming announcement has a valid sender-ID fingerprint, a
+valid Ed25519 signature, a signing key consistent with any pinned key, and TTL
+7. Upstream sends its own announcements with `messageTTLDefault` (7), so TTL 7
+identifies the directly connected peer; relayed and RSR copies have a lower
+TTL and can be older, so they never move the clock. Once the clock is set, an
+announcement more than 15 minutes old is rejected, matching upstream
+`BLEPacketFreshnessPolicy`. The local clock then advances from `millis()`. A
 local announcement is sent after synchronization and every 20 seconds while the
 link remains active.
 
@@ -471,8 +498,9 @@ Types bytes:  03-04
 Types value:  0x0403 [announce, message, groupMessage]
 ```
 
-The firmware now retains the signing key only from a sender-ID-checked and
-signature-verified announcement on the active link. A sync request is accepted
+The firmware retains signing keys only from sender-ID-checked and
+signature-verified announcements, in the verified peer registry described in
+[Verified Peer Registry](#verified-peer-registry). A sync request is accepted
 only when all of the following are true:
 
 1. TTL is zero.
@@ -542,13 +570,14 @@ use the actual GCS membership result.
 | Version 1 packet parsing | Complete for current fields | Header and optional sections parsed |
 | Version 2 packet parsing | Partial | Header and route parsing implemented, not fully exercised |
 | Fragment parsing | Complete | Correct 13-byte fragment header |
-| Fragment reassembly | Complete for one active assembly | Concurrent assemblies not supported |
+| Fragment reassembly | Complete for one assembly on hardware | Two concurrent assemblies keyed by sender ID and fragment ID; host tests pass |
 | Announcement TLV decoding | Complete | Required and current optional fields decoded |
 | Sender-ID fingerprint | Complete | `VALID` observed on the XIAO with a live announcement |
 | Signature extraction | Complete | Correct 64-byte location after payload |
 | Ed25519 verification | Complete | `VALID` observed on the XIAO with a live announcement |
 | Compressed payload decoding | Not implemented | Parser logs and skips compressed payloads |
-| Active-link verified peer cache | Implemented | One sender ID and Ed25519 key; cleared on disconnect |
+| Verified peer registry | Implemented; hardware test pending | Eight peers in RAM, LRU eviction, signing-key pinning |
+| Clock source policy | Implemented; hardware test pending | Direct (TTL 7) verified announcements only; stale announcements rejected |
 | Persistent peer registry | Not implemented | No durable verified-peer or Noise-authenticated state |
 | Local identity persistence | Implemented; hardware test pending | Versioned 104-byte LittleFS seed record |
 | Local X25519 identity | Implemented | Derived from the stored 32-byte seed |
@@ -587,10 +616,10 @@ MAX_LOCAL_MESSAGE_BYTES = 1024
 LOCAL_MESSAGE_CACHE_SIZE = 4
 ```
 
-The current fragment storage reserves approximately 7.7 KiB, and the signing
-verification buffer reserves 2 KiB. This is acceptable on the XIAO nRF52840,
-but a multi-peer assembly table should allocate entries deliberately rather
-than multiplying the current structure without a memory budget. The public
+The two fragment assemblies reserve approximately 15.4 KiB, and the signing
+verification buffer reserves 2 KiB. Further assembly slots cost 7.7 KiB each,
+so the slot count should be raised only against a measured RAM budget. The
+verified peer registry reserves about 2.4 KiB. The public
 message duplicate ring reserves 1 KiB. The local message cache reserves about
 4.5 KiB, and the outbound message, fragment, and serial-line buffers reserve
 about 3.7 KiB more.
@@ -636,17 +665,22 @@ Arduino loop. Lock acquisition has a one-second timeout and fails closed.
   the installed LittleFS and internal-filesystem headers.
 - First-boot creation and reboot loading of the identity record have not yet
   been confirmed on the XIAO hardware.
-- The public `MESSAGE` receive and transmit paths pass 43 host-side test
-  cases. The receive path is covered by 22 of them (see
-  [Host Test Harness](#host-test-harness)), including signed ASCII, Japanese
-  and emoji text, duplicate suppression, invalid and missing signatures,
-  spoofed sender IDs, stale messages, fragmented long text, invalid UTF-8,
-  and terminal-control escaping. The remaining cases cover transmitted wire
-  format and signatures, fragmentation and reassembly, serial-input limits,
-  GCS-driven RSR message responses, the since cursor, and disconnect cleanup.
+- The host harness passes 54 test cases (see
+  [Host Test Harness](#host-test-harness)). The receive path cases cover
+  signed ASCII, Japanese and emoji text, duplicate suppression, invalid and
+  missing signatures, spoofed sender IDs, stale messages, fragmented long
+  text, invalid UTF-8, and terminal-control escaping. The transmit path cases
+  cover wire format and signatures, outbound fragmentation, serial-input
+  limits, GCS-driven RSR message responses, the since cursor, and disconnect
+  cleanup. The registry and assembly cases cover relayed peers, signing-key
+  pinning, stale announcements, clock-source selection, LRU eviction, and
+  interleaved fragment streams.
 - The source passes `git diff --check`.
-- The sketch passes a C++11 syntax check with the XIAO nRF52840 ARM compiler.
-- Object generation with the XIAO toolchain succeeded.
+- The 2026-08-11 revision passed a C++11 syntax check and object generation
+  with the XIAO nRF52840 ARM compiler. The public-message, registry, and
+  fragmentation changes have so far been compiled only on the host, with
+  `-Wall -Wextra` and no warnings; an Arduino IDE build for the XIAO is still
+  required.
 - The linked Adafruit nRFCrypto archive exports `CRYS_ECEDW_Verify`,
   `CRYS_ECEDW_Sign`, `CRYS_ECEDW_SeedKeyPair`, and
   `CRYS_ECMONT_SeedKeyPair`.
@@ -699,7 +733,7 @@ this phase.
 ### Phase 2: Authenticate and Decode
 
 1. Add a `MESSAGE` branch to the packet parser.
-2. Require the sender to match the active-link verified peer cache.
+2. Require the sender to match an entry in the verified peer registry.
 3. Require and verify the Ed25519 packet signature with the signing key learned
    from that peer's verified announcement.
 4. Reject compressed payloads until decompression support exists.
@@ -737,9 +771,9 @@ rejection prints a reason and never prints the payload.
 2. Accept a missing or all-`0xFF` recipient as broadcast, and a recipient equal
    to the local sender ID as directed. Reject any other recipient.
 3. Reject compressed payloads.
-4. Require a signature and a signing key from the active-link verified peer
-   cache. The cached nickname from that verified announcement is used as the
-   display name.
+4. Require a signature and a signing key from the verified peer registry.
+   The cached nickname from that verified announcement is used as the display
+   name.
 5. Require the synchronized clock and, for broadcast messages only, reject a
    timestamp more than six hours old. This matches upstream
    `BLEPublicMessagePolicy` and `syncPublicMessageMaxAgeSeconds`.
@@ -757,8 +791,9 @@ rejection prints a reason and never prints the payload.
     log. Valid UTF-8 nicknames use the same escaping.
 
 The duplicate ring survives reconnects so that sync re-delivery after a
-reconnect is not printed twice. The verified peer cache is still cleared on
-disconnect, so messages are rejected until the peer announces again.
+reconnect is not printed twice. The verified peer registry also survives
+reconnects, so a pinned peer's messages are accepted before it announces
+again.
 
 ### Phase 3: Acceptance Policy
 
@@ -790,8 +825,8 @@ serial evidence added to this document.
 Every case in this matrix currently passes in the host test harness. The
 harness additionally covers altered content, a spoofed sender ID with a
 different signing key, an explicit all-`0xFF` broadcast recipient, a message
-addressed to another peer, a self echo, compressed payloads, and clearing of
-the verified peer cache on disconnect.
+addressed to another peer, a self echo, compressed payloads, and retention of
+the verified peer registry across a reconnect.
 
 ### Host Test Harness
 
@@ -908,8 +943,8 @@ already shown in the transmission log.
 
 ## Deferred Work
 
-1. Persist or bound a multi-peer verified registry and replace the single
-   fragment assembly with a sender-ID/fragment-ID keyed table.
+1. Persist the verified peer registry and its pinned signing keys across
+   reboots, and define how a peer's legitimate key change is accepted.
 2. Define an explicit local-identity reset and backup policy.
 3. Enable the BLE peripheral role for full dual-role mesh participation.
 4. Implement `Noise_XX_25519_ChaChaPoly_SHA256`, bind the authenticated static

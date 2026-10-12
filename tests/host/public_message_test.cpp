@@ -130,7 +130,7 @@ int main() {
 
   connect_callback(0);
   out = feed(signPacket(peer, packet(0x01, 7, T0, 0x02, peer.id, nullptr, ann)));
-  CHECK(has(out, "Sender ID verification: VALID") && has(out, "Verified peer cache: UPDATED"), "announce verified");
+  CHECK(has(out, "Sender ID verification: VALID") && has(out, "Verified peer cache: ADDED (1 / 8)"), "announce verified");
   loop();
 
   out = feed(msg(peer, T0 + 1000, "hello xiao"));
@@ -199,6 +199,49 @@ int main() {
   out = all;
   CHECK(total > 1 && has(out, "FRAGMENT REASSEMBLY COMPLETE") && count(out, "Content: ") == 1 && has(out, ("Content: " + longText + "\n").c_str()),
         "fragmented long message displayed once");
+
+  // Interleaved fragment streams from two senders that reuse the same fragment ID.
+  auto fragmentsOf = [](const Peer& p, const Bytes& innerPkt, const uint8_t* id, uint64_t ts) {
+    std::vector<Bytes> frames; size_t chunkLen = 200; uint16_t n = (innerPkt.size() + chunkLen - 1) / chunkLen;
+    for (uint16_t i = 0; i < n; i++) {
+      Bytes fp(id, id + 8); fp.push_back(i >> 8); fp.push_back(i & 0xFF); fp.push_back(n >> 8); fp.push_back(n & 0xFF); fp.push_back(0x02);
+      size_t e = std::min(innerPkt.size(), (size_t)(i + 1) * chunkLen); fp.insert(fp.end(), innerPkt.begin() + i * chunkLen, innerPkt.begin() + e);
+      frames.push_back(packet(0x20, 7, ts, 0x00, p.id, nullptr, fp)); }
+    return frames; };
+  Peer second = makePeer(55);
+  {
+    Bytes a; tlv(a, 1, (const uint8_t*)"second", 6); tlv(a, 2, second.xPub, 32); tlv(a, 3, second.edPub, 32);
+    feed(signPacket(second, packet(0x01, 4, T0 + 9100, 0x02, second.id, nullptr, a)));
+  }
+  uint8_t sharedId[8] = {7,7,7,7,7,7,7,7};
+  auto streamA = fragmentsOf(peer, msg(peer, T0 + 9200, std::string(450, 'A')), sharedId, T0 + 9200);
+  auto streamB = fragmentsOf(second, msg(second, T0 + 9300, std::string(450, 'B')), sharedId, T0 + 9300);
+  all.clear();
+  for (size_t i = 0; i < std::max(streamA.size(), streamB.size()); i++) {
+    if (i < streamA.size()) all += feed(streamA[i]);
+    if (i < streamB.size()) all += feed(streamB[i]);
+  }
+  out = all;
+  CHECK(count(out, "FRAGMENT REASSEMBLY COMPLETE") == 2 && has(out, ("Content: " + std::string(450, 'A')).c_str())
+        && has(out, ("Content: " + std::string(450, 'B')).c_str()), "interleaved streams from two senders both reassemble");
+
+  uint8_t ids[3][8] = {{1,1,1,1,1,1,1,1},{2,2,2,2,2,2,2,2},{3,3,3,3,3,3,3,3}};
+  std::vector<std::vector<Bytes>> streams;
+  for (int k = 0; k < 3; k++) { g_millis += 5; streams.push_back(fragmentsOf(peer, msg(peer, T0 + 9400 + k, std::string(450, 'a' + k)), ids[k], T0 + 9400 + k)); }
+  all.clear();
+  for (int k = 0; k < 3; k++) { g_millis += 5; all += feed(streams[k][0]); }
+  // Stream 0 was evicted; complete the two retained streams.
+  for (int k = 1; k < 3; k++) for (size_t i = 1; i < streams[k].size(); i++) all += feed(streams[k][i]);
+  out = all;
+  CHECK(has(out, "Fragment assembly evicted: 01-01-01-01-01-01-01-01") && !has(out, ("Content: " + std::string(450, 'a')).c_str())
+        && has(out, ("Content: " + std::string(450, 'b')).c_str()) && has(out, ("Content: " + std::string(450, 'c')).c_str()),
+        "oldest assembly evicted when slots are full");
+
+  {
+    Bytes fp(sharedId, sharedId + 8); fp.insert(fp.end(), {0, 0, 0, 1, 0x20, 1, 0x20});
+    out = feed(packet(0x20, 7, T0 + 9500, 0x00, peer.id, nullptr, fp));
+    CHECK(has(out, "Nested fragment rejected"), "nested fragment rejected");
+  }
 
   // Packet ID refactor matches the official definition for the cached local announce.
   uint8_t cached[MAX_ANNOUNCE_PACKET]; size_t cl = 0;
@@ -311,7 +354,48 @@ int main() {
   CHECK(has(out, "no Bitchat link") && bitchatChar.writes.empty(), "send rejected while disconnected");
 
   out = feed(msg(peer, T0 + 10000, "after disconnect"));
-  CHECK(has(out, "sender has no verified ANNOUNCE"), "peer cache cleared on disconnect");
+  CHECK(has(out, "Content: after disconnect"), "pinned peer survives reconnect");
+  connect_callback(0);
+
+  // ---- Multi-peer registry ----
+  auto announceOf = [&](const Peer& p, const uint8_t* signingPub, const char* name) {
+    Bytes a; tlv(a, 1, (const uint8_t*)name, strlen(name)); tlv(a, 2, p.xPub, 32); tlv(a, 3, signingPub, 32); return a; };
+  uint64_t before = 0; currentEpochMilliseconds(&before);
+  Peer remote = makePeer(21);
+  out = feed(signPacket(remote, packet(0x01, 5, before + 600000, 0x02, remote.id, nullptr, announceOf(remote, remote.edPub, "remote"))));
+  uint64_t after = 0; currentEpochMilliseconds(&after);
+  CHECK(has(out, "Verified peer cache: ADDED (3 / 8)") && after - before < 1000, "relayed announce added without moving the clock");
+  out = feed(msg(remote, before + 1000, "via mesh", 4));
+  CHECK(has(out, "Sender: remote") && has(out, "Content: via mesh"), "message from relayed peer accepted");
+  g_millis += 31000;
+  out = feed(requestSync(peer, before + 2000, Bytes{0x00}, 0x0001));
+  CHECK(has(out, "Recipient verification: VALID") && has(out, "Signature verification: VALID") && has(out, "REQUEST_SYNC fields: VALID"),
+        "direct peer REQUEST_SYNC still verified after relayed announce");
+
+  // Impersonation: the victim's public Noise key paired with the attacker's signing key.
+  Peer attacker = makePeer(33); memcpy(attacker.xPub, peer.xPub, 32); memcpy(attacker.id, peer.id, 8);
+  out = feed(signPacket(attacker, packet(0x01, 7, before + 3000, 0x02, attacker.id, nullptr, announceOf(attacker, attacker.edPub, "anon8168"))));
+  CHECK(has(out, "Sender ID verification: VALID") && has(out, "Signature verification: VALID")
+        && has(out, "REJECTED (signing key differs from pinned key"), "signing key replacement rejected");
+  out = feed(msg(attacker, before + 4000, "forged"));
+  CHECK(has(out, "signature verification failed") && !has(out, "Content:"), "attacker message still rejected");
+  out = feed(msg(peer, before + 5000, "still genuine"));
+  CHECK(has(out, "Content: still genuine"), "genuine peer still accepted");
+
+  out = feed(signPacket(remote, packet(0x01, 6, before - 16ULL * 60 * 1000, 0x02, remote.id, nullptr, announceOf(remote, remote.edPub, "renamed"))));
+  CHECK(has(out, "ANNOUNCE rejected: stale") && !has(out, "Verified peer cache"), "stale announce rejected");
+
+  std::string evictions;
+  for (uint8_t i = 0; i < 7; i++) {
+    g_millis += 10;
+    Peer extra = makePeer(40 + i);
+    evictions += feed(signPacket(extra, packet(0x01, 3, before + 6000, 0x02, extra.id, nullptr, announceOf(extra, extra.edPub, "extra"))));
+  }
+  out = evictions;
+  // Registry holds peer, second, remote, and seven extras: two evictions.
+  CHECK(has(out, "ADDED (8 / 8)") && count(out, "EVICTED") == 2, "registry bounded with LRU eviction");
+  out = feed(msg(peer, before + 7000, "least recent evicted"));
+  CHECK(has(out, "sender has no verified ANNOUNCE"), "least recently announced peer evicted first");
 
   std::cout << (failures ? "FAILURES: " : "ALL PASSED ") << failures << "\n";
   return failures ? 1 : 0;

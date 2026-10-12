@@ -8,12 +8,14 @@
 using namespace Adafruit_LittleFS_Namespace;
 
 #define MAX_FRAGMENTS      16
+#define FRAGMENT_ASSEMBLY_SLOTS 2
 #define MAX_FRAGMENT_DATA  480
 #define MAX_REASSEMBLED    8192
 #define MAX_SIGNING_DATA   2048
 #define MAX_ANNOUNCE_PACKET 256
 #define MAX_REQUEST_SYNC_GCS 1024
 #define MAX_NICKNAME_BYTES 255
+#define MAX_VERIFIED_PEERS 8
 #define SEEN_PUBLIC_MESSAGE_RING_SIZE 64
 #define MAX_LOCAL_MESSAGE_BYTES 1024
 #define MAX_LOCAL_MESSAGE_PACKET (14 + 8 + MAX_LOCAL_MESSAGE_BYTES + 64)
@@ -32,6 +34,11 @@ static const uint8_t REQUEST_SYNC_RESPONSE_LIMIT = 8;
 // Matches upstream bleFragmentSpacingMs for broadcast fragments.
 static const uint32_t FRAGMENT_SPACING_MS = 30;
 static const size_t MIN_FRAGMENT_CHUNK = 64;
+// Upstream messageTTLDefault. A peer's own announcement arrives with this TTL
+// on a direct link; relayed copies arrive with a lower TTL.
+static const uint8_t DIRECT_ANNOUNCE_TTL = 7;
+// Matches upstream BLEPacketFreshnessPolicy.defaultMaxAgeSeconds.
+static const uint64_t ANNOUNCE_MAX_AGE_MS = 900ULL * 1000;
 // Matches the upstream public-message acceptance and gossip-sync window.
 static const uint64_t PUBLIC_MESSAGE_MAX_AGE_MS = 6ULL * 60 * 60 * 1000;
 static const char IDENTITY_FILE_PATH[] = "/bitchat_identity.bin";
@@ -58,6 +65,15 @@ struct VerifiedPeerIdentity
   uint8_t signingPublicKey[32];
   uint8_t nickname[MAX_NICKNAME_BYTES];
   uint8_t nicknameLength;
+  uint32_t lastSeenAt;
+};
+
+enum VerifiedPeerUpdate
+{
+  VERIFIED_PEER_ADDED,
+  VERIFIED_PEER_REFRESHED,
+  VERIFIED_PEER_KEY_MISMATCH,
+  VERIFIED_PEER_LOCK_TIMEOUT
 };
 
 struct LocalMessageEntry
@@ -86,6 +102,7 @@ struct FragmentAssembly
 {
   bool active;
 
+  uint8_t senderId[8];
   uint8_t id[8];
   uint8_t originalType;
 
@@ -100,7 +117,9 @@ struct FragmentAssembly
   uint32_t startedAt;
 };
 
-FragmentAssembly fragmentAssembly;
+// Assemblies are keyed by sender ID and fragment ID, so a relayed fragment
+// stream from another peer does not discard the direct peer's assembly.
+FragmentAssembly fragmentAssemblies[FRAGMENT_ASSEMBLY_SLOTS];
 
 // Packet IDs of public messages that passed authentication. Only accessed from
 // the notification processing path, like the fragment assembly.
@@ -116,7 +135,9 @@ uint32_t localMessageSequence = 0;
 uint8_t localMessageResponsePendingMask = 0;
 
 LocalIdentity localIdentity;
-VerifiedPeerIdentity verifiedPeer;
+// Signature-verified peers, keyed by sender ID. A signing key is pinned on first
+// use and never silently replaced, matching upstream BLEAnnounceTrustPolicy.
+VerifiedPeerIdentity verifiedPeers[MAX_VERIFIED_PEERS];
 SemaphoreHandle_t cryptoMutex = NULL;
 SemaphoreHandle_t protocolStateMutex = NULL;
 
@@ -164,7 +185,11 @@ volatile bool clockSynced = false;
 
 void parse_bitchat_packet(const uint8_t* data, size_t len);
 void evaluateLocalMessageSync(const RequestSyncPayload& request);
-void handle_fragment(const uint8_t* payload, uint16_t payloadLength);
+void handle_fragment(
+  const uint8_t* senderId,
+  const uint8_t* payload,
+  uint16_t payloadLength
+);
 void scan_callback(ble_gap_evt_adv_report_t* report);
 void connect_callback(uint16_t conn_handle);
 void notify_callback(
@@ -910,7 +935,23 @@ bool takeProtocolStateMutex()
     xSemaphoreTake(protocolStateMutex, pdMS_TO_TICKS(100)) == pdTRUE;
 }
 
-void rememberVerifiedPeer(
+VerifiedPeerIdentity* findVerifiedPeer(const uint8_t* senderId)
+{
+  for (uint8_t i = 0; i < MAX_VERIFIED_PEERS; i++)
+  {
+    if (
+      verifiedPeers[i].ready &&
+      memcmp(verifiedPeers[i].senderId, senderId, 8) == 0
+    )
+    {
+      return &verifiedPeers[i];
+    }
+  }
+
+  return NULL;
+}
+
+VerifiedPeerUpdate rememberVerifiedPeer(
   const uint8_t* senderId,
   const uint8_t* signingPublicKey,
   const uint8_t* nickname,
@@ -920,17 +961,78 @@ void rememberVerifiedPeer(
   if (!takeProtocolStateMutex())
   {
     Serial.println("Verified peer cache: LOCK TIMEOUT");
-    return;
+    return VERIFIED_PEER_LOCK_TIMEOUT;
   }
 
-  memcpy(verifiedPeer.senderId, senderId, 8);
-  memcpy(verifiedPeer.signingPublicKey, signingPublicKey, 32);
-  memcpy(verifiedPeer.nickname, nickname, nicknameLength);
-  verifiedPeer.nicknameLength = nicknameLength;
-  verifiedPeer.ready = true;
+  VerifiedPeerIdentity* peer = findVerifiedPeer(senderId);
+  VerifiedPeerUpdate result = VERIFIED_PEER_REFRESHED;
+
+  if (peer != NULL && memcmp(peer->signingPublicKey, signingPublicKey, 32) != 0)
+  {
+    xSemaphoreGive(protocolStateMutex);
+    // The sender ID derives from the public Noise key, so anyone can pair it
+    // with their own signing key and produce a valid self-signature.
+    Serial.println(
+      "Verified peer cache: REJECTED (signing key differs from pinned key; possible impersonation)"
+    );
+    return VERIFIED_PEER_KEY_MISMATCH;
+  }
+
+  if (peer == NULL)
+  {
+    result = VERIFIED_PEER_ADDED;
+
+    // Use a free entry, or evict the least recently announced peer.
+    peer = &verifiedPeers[0];
+    for (uint8_t i = 0; i < MAX_VERIFIED_PEERS; i++)
+    {
+      if (!verifiedPeers[i].ready)
+      {
+        peer = &verifiedPeers[i];
+        break;
+      }
+
+      if (
+        (uint32_t)(millis() - verifiedPeers[i].lastSeenAt) >
+        (uint32_t)(millis() - peer->lastSeenAt)
+      )
+      {
+        peer = &verifiedPeers[i];
+      }
+    }
+
+    if (peer->ready)
+    {
+      Serial.print("Verified peer cache: EVICTED ");
+      printHex(peer->senderId, 8);
+      Serial.println();
+    }
+
+    secureZero(peer, sizeof(*peer));
+    memcpy(peer->senderId, senderId, 8);
+    memcpy(peer->signingPublicKey, signingPublicKey, 32);
+    peer->ready = true;
+  }
+
+  memcpy(peer->nickname, nickname, nicknameLength);
+  peer->nicknameLength = nicknameLength;
+  peer->lastSeenAt = millis();
+
+  uint8_t count = 0;
+  for (uint8_t i = 0; i < MAX_VERIFIED_PEERS; i++)
+  {
+    if (verifiedPeers[i].ready) count++;
+  }
   xSemaphoreGive(protocolStateMutex);
 
-  Serial.println("Verified peer cache: UPDATED");
+  Serial.print("Verified peer cache: ");
+  Serial.print(result == VERIFIED_PEER_ADDED ? "ADDED" : "REFRESHED");
+  Serial.print(" (");
+  Serial.print(count);
+  Serial.print(" / ");
+  Serial.print(MAX_VERIFIED_PEERS);
+  Serial.println(")");
+  return result;
 }
 
 bool getVerifiedPeer(
@@ -945,21 +1047,20 @@ bool getVerifiedPeer(
     return false;
   }
 
-  bool found = verifiedPeer.ready &&
-    memcmp(verifiedPeer.senderId, senderId, 8) == 0;
-  if (found)
+  VerifiedPeerIdentity* peer = findVerifiedPeer(senderId);
+  if (peer != NULL)
   {
-    memcpy(signingPublicKey, verifiedPeer.signingPublicKey, 32);
+    memcpy(signingPublicKey, peer->signingPublicKey, 32);
 
     if (nickname != NULL && nicknameLength != NULL)
     {
-      memcpy(nickname, verifiedPeer.nickname, verifiedPeer.nicknameLength);
-      *nicknameLength = verifiedPeer.nicknameLength;
+      memcpy(nickname, peer->nickname, peer->nicknameLength);
+      *nicknameLength = peer->nicknameLength;
     }
   }
 
   xSemaphoreGive(protocolStateMutex);
-  return found;
+  return peer != NULL;
 }
 
 bool getVerifiedPeerSigningKey(
@@ -3047,6 +3148,7 @@ void parse_bitchat_packet(const uint8_t* data, size_t len)
 
     // Store the fragment for reassembly.
     handle_fragment(
+      senderId,
       payload,
       payloadLength
     );
@@ -3110,15 +3212,32 @@ void parse_bitchat_packet(const uint8_t* data, size_t len)
         announceSigningPublicKey
       );
 
-      if (signatureValid && announceIdentityValid)
+      uint64_t announceTimestamp = readBE64(data + 3);
+      uint64_t now = 0;
+      bool stale =
+        currentEpochMilliseconds(&now) &&
+        now >= ANNOUNCE_MAX_AGE_MS &&
+        announceTimestamp < now - ANNOUNCE_MAX_AGE_MS;
+
+      if (signatureValid && announceIdentityValid && stale)
       {
+        Serial.println("ANNOUNCE rejected: stale (older than 15 minutes)");
+      }
+      else if (
+        signatureValid &&
+        announceIdentityValid &&
         rememberVerifiedPeer(
           senderId,
           announceSigningPublicKey,
           announceNickname,
           announceNicknameLength
-        );
-        synchronizeClock(readBE64(data + 3));
+        ) <= VERIFIED_PEER_REFRESHED &&
+        ttl == DIRECT_ANNOUNCE_TTL
+      )
+      {
+        // Only a peer's own, unrelayed announcement sets the clock and
+        // prompts a local announcement in reply.
+        synchronizeClock(announceTimestamp);
         requestLocalAnnounce();
       }
     }
@@ -3159,12 +3278,75 @@ void parse_bitchat_packet(const uint8_t* data, size_t len)
   }
 }
 
-void resetFragmentAssembly()
+void resetFragmentAssembly(FragmentAssembly& assembly)
 {
-  memset(&fragmentAssembly, 0, sizeof(fragmentAssembly));
+  memset(&assembly, 0, sizeof(assembly));
+}
+
+// Returns the assembly for this sender and fragment ID, or starts one in a
+// free, expired, or (when all are busy) the oldest slot.
+FragmentAssembly& selectFragmentAssembly(
+  const uint8_t* senderId,
+  const uint8_t* fragmentId,
+  bool* isNew
+)
+{
+  FragmentAssembly* candidate = &fragmentAssemblies[0];
+  bool candidateFree = false;
+
+  for (uint8_t i = 0; i < FRAGMENT_ASSEMBLY_SLOTS; i++)
+  {
+    FragmentAssembly& assembly = fragmentAssemblies[i];
+
+    // Discard an assembly that has been inactive for more than 30 seconds.
+    if (assembly.active && millis() - assembly.startedAt > 30000)
+    {
+      Serial.println("Fragment assembly timeout");
+      resetFragmentAssembly(assembly);
+    }
+
+    if (
+      assembly.active &&
+      memcmp(assembly.senderId, senderId, 8) == 0 &&
+      memcmp(assembly.id, fragmentId, 8) == 0
+    )
+    {
+      *isNew = false;
+      return assembly;
+    }
+
+    if (candidateFree)
+    {
+      continue;
+    }
+
+    if (!assembly.active)
+    {
+      candidate = &assembly;
+      candidateFree = true;
+    }
+    else if (
+      (uint32_t)(millis() - assembly.startedAt) >
+      (uint32_t)(millis() - candidate->startedAt)
+    )
+    {
+      candidate = &assembly;
+    }
+  }
+
+  if (!candidateFree)
+  {
+    Serial.print("Fragment assembly evicted: ");
+    printHex(candidate->id, 8);
+    Serial.println();
+  }
+
+  *isNew = true;
+  return *candidate;
 }
 
 void handle_fragment(
+  const uint8_t* senderId,
   const uint8_t* payload,
   uint16_t payloadLength
 )
@@ -3223,31 +3405,27 @@ void handle_fragment(
     return;
   }
 
-  // Discard an assembly that has been inactive for more than 30 seconds.
-  if (
-    fragmentAssembly.active &&
-    millis() - fragmentAssembly.startedAt > 30000
-  )
+  if (originalType == 0x20)
   {
-    Serial.println("Fragment assembly timeout");
-    resetFragmentAssembly();
+    Serial.println("Nested fragment rejected");
+    return;
   }
 
-  bool sameId =
-    fragmentAssembly.active &&
-    memcmp(
-      fragmentAssembly.id,
-      fragmentId,
-      8
-    ) == 0;
+  bool isNewAssembly = false;
+  FragmentAssembly& fragmentAssembly = selectFragmentAssembly(
+    senderId,
+    fragmentId,
+    &isNewAssembly
+  );
 
   // Start a new fragment ID.
-  if (!sameId)
+  if (isNewAssembly)
   {
-    resetFragmentAssembly();
+    resetFragmentAssembly(fragmentAssembly);
 
     fragmentAssembly.active = true;
 
+    memcpy(fragmentAssembly.senderId, senderId, 8);
     memcpy(
       fragmentAssembly.id,
       fragmentId,
@@ -3266,14 +3444,14 @@ void handle_fragment(
   if (fragmentAssembly.total != total)
   {
     Serial.println("Fragment total mismatch");
-    resetFragmentAssembly();
+    resetFragmentAssembly(fragmentAssembly);
     return;
   }
 
   if (fragmentAssembly.originalType != originalType)
   {
     Serial.println("Fragment original type mismatch");
-    resetFragmentAssembly();
+    resetFragmentAssembly(fragmentAssembly);
     return;
   }
 
@@ -3335,7 +3513,7 @@ void handle_fragment(
     )
     {
       Serial.println("Reassembled packet too large");
-      resetFragmentAssembly();
+      resetFragmentAssembly(fragmentAssembly);
       return;
     }
 
@@ -3354,7 +3532,7 @@ void handle_fragment(
   )
   {
     Serial.println("Reassembled packet type does not match fragment metadata");
-    resetFragmentAssembly();
+    resetFragmentAssembly(fragmentAssembly);
     return;
   }
 
@@ -3371,7 +3549,7 @@ void handle_fragment(
   Serial.println();
 
   // Release the assembly before recursively parsing the inner packet.
-  resetFragmentAssembly();
+  resetFragmentAssembly(fragmentAssembly);
 
   // Parse the reassembled original Bitchat packet.
   parse_bitchat_packet(
@@ -3684,7 +3862,6 @@ void disconnect_callback(
 
   if (takeProtocolStateMutex())
   {
-    secureZero(&verifiedPeer, sizeof(verifiedPeer));
     localMessageResponsePendingMask = 0;
     xSemaphoreGive(protocolStateMutex);
   }

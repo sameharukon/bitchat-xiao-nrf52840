@@ -29,7 +29,8 @@ a host-side test harness and are awaiting on-device verification.
 | GATT connection and notification subscription | Verified on hardware |
 | ATT MTU 247 negotiation | Verified on hardware |
 | Version 1 packet parsing | Implemented for the currently observed fields |
-| Fragment reassembly | Verified for one active assembly |
+| Fragment reassembly | Verified for one assembly; two concurrent assemblies keyed by sender in host tests |
+| Multi-peer verified registry with signing-key pinning | Implemented; host tests pass, hardware test pending |
 | Announcement TLV decoding | Verified on hardware |
 | Sender ID derivation from the X25519 key | Verified on hardware |
 | Ed25519 announcement verification | Verified on hardware |
@@ -129,8 +130,8 @@ from notification handling are performed by the Arduino loop.
 When the connected iPhone sends a public message, the XIAO prints it after the
 following checks pass:
 
-1. The sender has a sender-ID-checked, signature-verified announcement on the
-   active link.
+1. The sender has a sender-ID-checked, signature-verified announcement in the
+   verified peer registry, either from the iPhone itself or relayed by it.
 2. The packet is broadcast, or directed to the XIAO, and is not compressed.
 3. A broadcast message is no more than six hours old, matching upstream.
 4. The packet ID has not already been displayed.
@@ -207,9 +208,11 @@ Set it to `1` only for a one-shot RSR response-path test, then return it to
 ## Known Limitations
 
 - The XIAO currently operates as a BLE central only.
-- Only one fragment assembly and one active-link verified peer are retained.
-  Public messages from peers that have not announced on the active link are
-  rejected.
+- At most eight verified peers and two concurrent fragment assemblies are
+  retained, in RAM only. Public messages from peers without a verified
+  announcement in the registry are rejected.
+- Signing keys are pinned on first use per sender ID. A legitimate key change
+  by a peer is rejected until the board restarts or the entry is evicted.
 - Sent messages are kept only in RAM, so they cannot be re-served after a
   reboot.
 - Public messages whose unsigned packet exceeds 2048 bytes (a payload above
