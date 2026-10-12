@@ -15,6 +15,9 @@ using namespace Adafruit_LittleFS_Namespace;
 #define MAX_REQUEST_SYNC_GCS 1024
 #define MAX_NICKNAME_BYTES 255
 #define SEEN_PUBLIC_MESSAGE_RING_SIZE 64
+#define MAX_LOCAL_MESSAGE_BYTES 1024
+#define MAX_LOCAL_MESSAGE_PACKET (14 + 8 + MAX_LOCAL_MESSAGE_BYTES + 64)
+#define LOCAL_MESSAGE_CACHE_SIZE 4
 #define IDENTITY_RECORD_DATA_SIZE 72
 #define IDENTITY_RECORD_SIZE 104
 
@@ -26,6 +29,9 @@ static const uint32_t ANNOUNCE_INTERVAL_MS = 20000;
 static const uint32_t ANNOUNCE_RETRY_MS = 1000;
 static const uint32_t REQUEST_SYNC_RESPONSE_WINDOW_MS = 30000;
 static const uint8_t REQUEST_SYNC_RESPONSE_LIMIT = 8;
+// Matches upstream bleFragmentSpacingMs for broadcast fragments.
+static const uint32_t FRAGMENT_SPACING_MS = 30;
+static const size_t MIN_FRAGMENT_CHUNK = 64;
 // Matches the upstream public-message acceptance and gossip-sync window.
 static const uint64_t PUBLIC_MESSAGE_MAX_AGE_MS = 6ULL * 60 * 60 * 1000;
 static const char IDENTITY_FILE_PATH[] = "/bitchat_identity.bin";
@@ -52,6 +58,16 @@ struct VerifiedPeerIdentity
   uint8_t signingPublicKey[32];
   uint8_t nickname[MAX_NICKNAME_BYTES];
   uint8_t nicknameLength;
+};
+
+struct LocalMessageEntry
+{
+  bool used;
+  uint32_t sequence;
+  uint64_t timestamp;
+  uint8_t packetId[16];
+  uint16_t packetLength;
+  uint8_t packet[MAX_LOCAL_MESSAGE_PACKET];
 };
 
 struct RequestSyncPayload
@@ -92,6 +108,13 @@ uint8_t seenPublicMessageIds[SEEN_PUBLIC_MESSAGE_RING_SIZE][16];
 uint8_t seenPublicMessageCount = 0;
 uint8_t seenPublicMessageNext = 0;
 
+// Recently transmitted local public messages, retained for sync responses.
+// Shared between the Arduino loop and BLE callbacks under protocolStateMutex.
+LocalMessageEntry localMessages[LOCAL_MESSAGE_CACHE_SIZE];
+uint8_t localMessageNext = 0;
+uint32_t localMessageSequence = 0;
+uint8_t localMessageResponsePendingMask = 0;
+
 LocalIdentity localIdentity;
 VerifiedPeerIdentity verifiedPeer;
 SemaphoreHandle_t cryptoMutex = NULL;
@@ -121,6 +144,7 @@ bool cryptoReady = false;
 bool identityFileSystemReady = false;
 volatile bool bitchatLinkReady = false;
 volatile uint8_t bitchatCharacteristicProperties = 0;
+volatile uint16_t bitchatLinkMtu = 23;
 volatile bool localAnnouncePending = false;
 volatile bool localAnnounceSent = false;
 volatile uint32_t lastLocalAnnounceSentAt = 0;
@@ -139,6 +163,7 @@ volatile uint32_t clockMillisAtSync = 0;
 volatile bool clockSynced = false;
 
 void parse_bitchat_packet(const uint8_t* data, size_t len);
+void evaluateLocalMessageSync(const RequestSyncPayload& request);
 void handle_fragment(const uint8_t* payload, uint16_t payloadLength);
 void scan_callback(ble_gap_evt_adv_report_t* report);
 void connect_callback(uint16_t conn_handle);
@@ -1175,6 +1200,90 @@ bool appendTlv(
   return true;
 }
 
+// Signs a local version 1 packet in place. The 64-byte signature is written
+// directly after the unsigned bytes, and the signature is verified before use.
+bool signLocalPacket(
+  uint8_t* packet,
+  size_t unsignedLength,
+  const char* label
+)
+{
+  size_t signingLength = signingDataLengthWithPadding(unsignedLength);
+  if (signingLength > MAX_SIGNING_DATA)
+  {
+    Serial.print("Local ");
+    Serial.print(label);
+    Serial.println(" signing error: signing data exceeds buffer");
+    return false;
+  }
+
+  static uint8_t signingData[MAX_SIGNING_DATA];
+  static CRYS_ECEDW_TempBuff_t signingTempBuffer;
+  memcpy(signingData, packet, unsignedLength);
+  signingData[2] = 0;
+  signingData[11] &= (0x01 | 0x04);
+
+  if (signingLength > unsignedLength)
+  {
+    size_t paddingLength = signingLength - unsignedLength;
+    memset(
+      signingData + unsignedLength,
+      (uint8_t)paddingLength,
+      paddingLength
+    );
+  }
+
+  size_t signatureLength = 64;
+  memset(&signingTempBuffer, 0, sizeof(signingTempBuffer));
+
+  if (!takeCryptoMutex())
+  {
+    Serial.print("Local ");
+    Serial.print(label);
+    Serial.println(" signing error: CryptoCell lock timeout");
+    return false;
+  }
+
+  CRYSError_t signResult = CRYS_ECEDW_Sign(
+    packet + unsignedLength,
+    &signatureLength,
+    signingData,
+    signingLength,
+    localIdentity.signingSecretKey,
+    sizeof(localIdentity.signingSecretKey),
+    &signingTempBuffer
+  );
+
+  if (signResult != CRYS_OK || signatureLength != 64)
+  {
+    xSemaphoreGive(cryptoMutex);
+    Serial.print("Local ");
+    Serial.print(label);
+    Serial.print(" signing error: 0x");
+    Serial.println((uint32_t)signResult, HEX);
+    return false;
+  }
+
+  memset(&signingTempBuffer, 0, sizeof(signingTempBuffer));
+  CRYSError_t verifyResult = CRYS_ECEDW_Verify(
+    packet + unsignedLength,
+    64,
+    localIdentity.signingPublicKey,
+    sizeof(localIdentity.signingPublicKey),
+    signingData,
+    signingLength,
+    &signingTempBuffer
+  );
+
+  xSemaphoreGive(cryptoMutex);
+
+  Serial.print("Local ");
+  Serial.print(label);
+  Serial.print(" signature self-check: ");
+  Serial.println(verifyResult == CRYS_OK ? "VALID" : "INVALID");
+  return verifyResult == CRYS_OK;
+}
+
 bool buildLocalAnnounce(
   uint64_t timestamp,
   uint8_t* packet,
@@ -1245,71 +1354,7 @@ bool buildLocalAnnounce(
   memcpy(packet + 14, localIdentity.senderId, 8);
   memcpy(packet + 22, payload, payloadLength);
 
-  size_t signingLength = signingDataLengthWithPadding(unsignedLength);
-  if (signingLength > MAX_SIGNING_DATA)
-  {
-    return false;
-  }
-
-  static uint8_t signingData[MAX_SIGNING_DATA];
-  static CRYS_ECEDW_TempBuff_t signingTempBuffer;
-  memcpy(signingData, packet, unsignedLength);
-  signingData[2] = 0;
-  signingData[11] = 0;
-
-  if (signingLength > unsignedLength)
-  {
-    size_t paddingLength = signingLength - unsignedLength;
-    memset(
-      signingData + unsignedLength,
-      (uint8_t)paddingLength,
-      paddingLength
-    );
-  }
-
-  size_t signatureLength = 64;
-  memset(&signingTempBuffer, 0, sizeof(signingTempBuffer));
-
-  if (!takeCryptoMutex())
-  {
-    Serial.println("Local ANNOUNCE signing error: CryptoCell lock timeout");
-    return false;
-  }
-
-  CRYSError_t signResult = CRYS_ECEDW_Sign(
-    packet + unsignedLength,
-    &signatureLength,
-    signingData,
-    signingLength,
-    localIdentity.signingSecretKey,
-    sizeof(localIdentity.signingSecretKey),
-    &signingTempBuffer
-  );
-
-  if (signResult != CRYS_OK || signatureLength != 64)
-  {
-    xSemaphoreGive(cryptoMutex);
-    Serial.print("Local ANNOUNCE signing error: 0x");
-    Serial.println((uint32_t)signResult, HEX);
-    return false;
-  }
-
-  memset(&signingTempBuffer, 0, sizeof(signingTempBuffer));
-  CRYSError_t verifyResult = CRYS_ECEDW_Verify(
-    packet + unsignedLength,
-    64,
-    localIdentity.signingPublicKey,
-    sizeof(localIdentity.signingPublicKey),
-    signingData,
-    signingLength,
-    &signingTempBuffer
-  );
-
-  xSemaphoreGive(cryptoMutex);
-
-  Serial.print("Local ANNOUNCE signature self-check: ");
-  Serial.println(verifyResult == CRYS_OK ? "VALID" : "INVALID");
-  if (verifyResult != CRYS_OK)
+  if (!signLocalPacket(packet, unsignedLength, "ANNOUNCE"))
   {
     return false;
   }
@@ -1327,6 +1372,141 @@ void requestLocalAnnounce()
   {
     localAnnouncePending = true;
   }
+}
+
+bool generateRandomBytes(uint8_t* buffer, size_t length)
+{
+  static nRFCrypto_Random random;
+
+  if (!takeCryptoMutex())
+  {
+    return false;
+  }
+
+  bool generated = random.begin();
+  if (generated)
+  {
+    generated = random.generate(buffer, length);
+    random.end();
+  }
+
+  xSemaphoreGive(cryptoMutex);
+  return generated;
+}
+
+bool writeBitchatFrame(const uint8_t* frame, uint16_t frameLength)
+{
+  uint16_t written = 0;
+  if (bitchatCharacteristicProperties & CHR_PROPS_WRITE_WO_RESP)
+  {
+    written = bitchatChar.write(frame, frameLength);
+  }
+  else if (bitchatCharacteristicProperties & CHR_PROPS_WRITE)
+  {
+    written = bitchatChar.write_resp(frame, frameLength);
+  }
+
+  Serial.print("GATT write: ");
+  if (written == frameLength)
+  {
+    Serial.print("OK (");
+    Serial.print(written);
+    Serial.println(" bytes)");
+    return true;
+  }
+
+  Serial.print("FAILED (");
+  Serial.print(written);
+  Serial.print(" / ");
+  Serial.print(frameLength);
+  Serial.println(" bytes)");
+  return false;
+}
+
+// Writes a complete version 1 packet, splitting it into FRAGMENT packets when
+// it does not fit in one ATT write. Each fragment repeats the original TTL,
+// timestamp, sender, and RSR state, matching the upstream fragment planner.
+bool transmitBitchatPacket(const uint8_t* packet, size_t packetLength)
+{
+  size_t maxWrite = bitchatLinkMtu > 3 ? bitchatLinkMtu - 3 : 0;
+
+  if (packetLength <= maxWrite)
+  {
+    return writeBitchatFrame(packet, (uint16_t)packetLength);
+  }
+
+  // Version 1 header, sender ID, and the 13-byte fragment header.
+  const size_t fragmentOverhead = 14 + 8 + 13;
+  if (maxWrite < fragmentOverhead + MIN_FRAGMENT_CHUNK)
+  {
+    Serial.println("Fragmentation: FAILED (link MTU too small)");
+    return false;
+  }
+
+  size_t chunkSize = maxWrite - fragmentOverhead;
+  if (chunkSize > MAX_FRAGMENT_DATA)
+  {
+    chunkSize = MAX_FRAGMENT_DATA;
+  }
+
+  size_t total = (packetLength + chunkSize - 1) / chunkSize;
+  if (total > MAX_FRAGMENTS)
+  {
+    Serial.println("Fragmentation: FAILED (too many fragments)");
+    return false;
+  }
+
+  uint8_t fragmentId[8];
+  if (!generateRandomBytes(fragmentId, sizeof(fragmentId)))
+  {
+    Serial.println("Fragmentation: FAILED (random fragment ID)");
+    return false;
+  }
+
+  Serial.print("Fragmentation: ");
+  Serial.print(total);
+  Serial.print(" fragments, chunk ");
+  Serial.print(chunkSize);
+  Serial.print(" bytes, ID ");
+  printHex(fragmentId, sizeof(fragmentId));
+  Serial.println();
+
+  static uint8_t frame[fragmentOverhead + MAX_FRAGMENT_DATA];
+  for (size_t index = 0; index < total; index++)
+  {
+    size_t offset = index * chunkSize;
+    size_t length = packetLength - offset < chunkSize
+      ? packetLength - offset
+      : chunkSize;
+    uint16_t payloadLength = (uint16_t)(13 + length);
+
+    frame[0] = 1;
+    frame[1] = 0x20;
+    frame[2] = packet[2];
+    memcpy(frame + 3, packet + 3, 8);
+    frame[11] = packet[11] & 0x10;
+    writeBE16(frame + 12, payloadLength);
+    memcpy(frame + 14, packet + 14, 8);
+    memcpy(frame + 22, fragmentId, 8);
+    writeBE16(frame + 30, (uint16_t)index);
+    writeBE16(frame + 32, (uint16_t)total);
+    frame[34] = packet[1];
+    memcpy(frame + 35, packet + offset, length);
+
+    if (index > 0)
+    {
+      delay(FRAGMENT_SPACING_MS);
+    }
+
+    if (!bitchatLinkReady || !writeBitchatFrame(frame, (uint16_t)(22 + payloadLength)))
+    {
+      Serial.print("Fragmentation: ABORTED at fragment ");
+      Serial.println(index);
+      return false;
+    }
+  }
+
+  return true;
 }
 
 bool sendLocalAnnounce()
@@ -1366,35 +1546,16 @@ bool sendLocalAnnounce()
   Serial.print("Packet length: ");
   Serial.println(packetLength);
 
-  uint16_t written = 0;
-  if (bitchatCharacteristicProperties & CHR_PROPS_WRITE_WO_RESP)
+  if (!transmitBitchatPacket(packet, packetLength))
   {
-    written = bitchatChar.write(packet, (uint16_t)packetLength);
-  }
-  else if (bitchatCharacteristicProperties & CHR_PROPS_WRITE)
-  {
-    written = bitchatChar.write_resp(packet, (uint16_t)packetLength);
+    return false;
   }
 
-  Serial.print("GATT write: ");
-  if (written == packetLength)
-  {
-    Serial.print("OK (");
-    Serial.print(written);
-    Serial.println(" bytes)");
-    localAnnouncePending = false;
-    localAnnounceSent = true;
-    lastLocalAnnounceSentAt = millis();
-    cacheLocalAnnouncePacket(packet, packetLength);
-    return true;
-  }
-
-  Serial.print("FAILED (");
-  Serial.print(written);
-  Serial.print(" / ");
-  Serial.print(packetLength);
-  Serial.println(" bytes)");
-  return false;
+  localAnnouncePending = false;
+  localAnnounceSent = true;
+  lastLocalAnnounceSentAt = millis();
+  cacheLocalAnnouncePacket(packet, packetLength);
+  return true;
 }
 
 bool reserveRequestSyncResponse()
@@ -1450,33 +1611,14 @@ bool sendRequestSyncAnnounceResponse()
   Serial.println("TTL: 0");
   Serial.println("Flags: 0x12 [signature, RSR]");
 
-  uint16_t written = 0;
-  if (bitchatCharacteristicProperties & CHR_PROPS_WRITE_WO_RESP)
+  if (!transmitBitchatPacket(packet, packetLength))
   {
-    written = bitchatChar.write(packet, (uint16_t)packetLength);
-  }
-  else if (bitchatCharacteristicProperties & CHR_PROPS_WRITE)
-  {
-    written = bitchatChar.write_resp(packet, (uint16_t)packetLength);
+    return false;
   }
 
-  Serial.print("GATT write: ");
-  if (written == packetLength)
-  {
-    Serial.print("OK (");
-    Serial.print(written);
-    Serial.println(" bytes)");
-    requestSyncResponsePending = false;
-    lastLocalAnnounceSentAt = millis();
-    return true;
-  }
-
-  Serial.print("FAILED (");
-  Serial.print(written);
-  Serial.print(" / ");
-  Serial.print(packetLength);
-  Serial.println(" bytes)");
-  return false;
+  requestSyncResponsePending = false;
+  lastLocalAnnounceSentAt = millis();
+  return true;
 }
 
 void serviceRequestSyncResponse()
@@ -1778,6 +1920,15 @@ void handleRequestSyncPacket(
   if (!parseRequestSyncPayload(payload, payloadLength, &request))
   {
     return;
+  }
+
+  if (request.types & (1ULL << 1))
+  {
+    evaluateLocalMessageSync(request);
+  }
+  else
+  {
+    Serial.println("REQUEST_SYNC response: MESSAGE not requested");
   }
 
   if ((request.types & (1ULL << 0)) == 0)
@@ -2095,8 +2246,8 @@ void handlePublicMessagePacket(
 
   if (localIdentity.ready && memcmp(senderId, localIdentity.senderId, 8) == 0)
   {
-    // The XIAO does not transmit public messages yet, so no self-authored
-    // copy can be a solicited sync response.
+    // The XIAO never sends REQUEST_SYNC, so no self-authored copy can be a
+    // solicited sync response, and its own messages are already displayed.
     Serial.println(
       ttl != 0
         ? "MESSAGE rejected: self echo"
@@ -2230,6 +2381,350 @@ void handlePublicMessagePacket(
   Serial.print("Content: ");
   printSafeUtf8(payload, payloadLength);
   Serial.println();
+}
+
+bool sendLocalPublicMessage(const uint8_t* text, size_t textLength)
+{
+  if (!localIdentity.ready)
+  {
+    Serial.println("MESSAGE TX rejected: local identity unavailable");
+    return false;
+  }
+
+  if (!bitchatLinkReady)
+  {
+    Serial.println("MESSAGE TX rejected: no Bitchat link");
+    return false;
+  }
+
+  uint64_t timestamp;
+  if (!currentEpochMilliseconds(&timestamp))
+  {
+    Serial.println(
+      "MESSAGE TX rejected: clock is not synchronized (waiting for a verified ANNOUNCE)"
+    );
+    return false;
+  }
+
+  if (textLength == 0 || textLength > MAX_LOCAL_MESSAGE_BYTES)
+  {
+    Serial.println("MESSAGE TX rejected: invalid length");
+    return false;
+  }
+
+  static uint8_t packet[MAX_LOCAL_MESSAGE_PACKET];
+  size_t unsignedLength = 14 + 8 + textLength;
+  size_t packetLength = unsignedLength + 64;
+
+  packet[0] = 1;
+  packet[1] = 0x02;
+  packet[2] = 7;
+  writeBE64(packet + 3, timestamp);
+  packet[11] = 0x02;
+  writeBE16(packet + 12, (uint16_t)textLength);
+  memcpy(packet + 14, localIdentity.senderId, 8);
+  memcpy(packet + 22, text, textLength);
+
+  if (!signLocalPacket(packet, unsignedLength, "MESSAGE"))
+  {
+    return false;
+  }
+
+  uint8_t packetId[16];
+  if (!calculatePacketIdFromFields(
+        packet + 1,
+        packet + 14,
+        packet + 3,
+        packet + 22,
+        textLength,
+        packetId
+      ))
+  {
+    Serial.println("MESSAGE TX rejected: packet ID calculation failed");
+    return false;
+  }
+
+  // Cache before writing so that a sync request arriving during a fragmented
+  // write already sees the message.
+  if (takeProtocolStateMutex())
+  {
+    LocalMessageEntry& entry = localMessages[localMessageNext];
+    localMessageResponsePendingMask &= ~(1 << localMessageNext);
+    entry.used = true;
+    entry.sequence = ++localMessageSequence;
+    entry.timestamp = timestamp;
+    memcpy(entry.packetId, packetId, sizeof(packetId));
+    entry.packetLength = (uint16_t)packetLength;
+    memcpy(entry.packet, packet, packetLength);
+    localMessageNext = (localMessageNext + 1) % LOCAL_MESSAGE_CACHE_SIZE;
+    xSemaphoreGive(protocolStateMutex);
+  }
+  else
+  {
+    Serial.println("Local MESSAGE cache: LOCK TIMEOUT");
+  }
+
+  Serial.println();
+  Serial.println("=== LOCAL PUBLIC MESSAGE TX ===");
+  Serial.print("Sender: ");
+  Serial.println(LOCAL_NICKNAME);
+  Serial.print("Sender ID: ");
+  printHex(localIdentity.senderId, sizeof(localIdentity.senderId));
+  Serial.println();
+  Serial.print("Timestamp (ms): ");
+  printUInt64(timestamp);
+  Serial.print(" (");
+  printUtcTimestamp(timestamp);
+  Serial.println(")");
+  Serial.print("Packet ID: ");
+  printHex(packetId, sizeof(packetId));
+  Serial.println();
+  Serial.print("Length: ");
+  Serial.print(textLength);
+  Serial.println(" bytes");
+  Serial.print("Packet length: ");
+  Serial.println(packetLength);
+  Serial.print("Content: ");
+  printSafeUtf8(text, textLength);
+  Serial.println();
+
+  return transmitBitchatPacket(packet, packetLength);
+}
+
+void evaluateLocalMessageSync(const RequestSyncPayload& request)
+{
+  struct Candidate
+  {
+    uint8_t slot;
+    uint32_t sequence;
+    uint64_t timestamp;
+    uint8_t packetId[16];
+  };
+
+  Candidate candidates[LOCAL_MESSAGE_CACHE_SIZE];
+  uint8_t candidateCount = 0;
+
+  uint64_t now;
+  if (!currentEpochMilliseconds(&now))
+  {
+    Serial.println("REQUEST_SYNC MESSAGE: clock is not synchronized");
+    return;
+  }
+
+  if (!takeProtocolStateMutex())
+  {
+    Serial.println("REQUEST_SYNC MESSAGE: LOCK TIMEOUT");
+    return;
+  }
+
+  for (uint8_t i = 0; i < LOCAL_MESSAGE_CACHE_SIZE; i++)
+  {
+    if (!localMessages[i].used)
+    {
+      continue;
+    }
+
+    Candidate& candidate = candidates[candidateCount++];
+    candidate.slot = i;
+    candidate.sequence = localMessages[i].sequence;
+    candidate.timestamp = localMessages[i].timestamp;
+    memcpy(candidate.packetId, localMessages[i].packetId, 16);
+  }
+
+  xSemaphoreGive(protocolStateMutex);
+
+  if (candidateCount == 0)
+  {
+    Serial.println("REQUEST_SYNC response: no cached local MESSAGE");
+    return;
+  }
+
+  uint8_t missingMask = 0;
+  for (uint8_t i = 0; i < candidateCount; i++)
+  {
+    const Candidate& candidate = candidates[i];
+
+    Serial.print("Local MESSAGE packet ID: ");
+    printHex(candidate.packetId, 16);
+    Serial.println();
+
+    if (
+      now >= PUBLIC_MESSAGE_MAX_AGE_MS &&
+      candidate.timestamp < now - PUBLIC_MESSAGE_MAX_AGE_MS
+    )
+    {
+      Serial.println("REQUEST_SYNC MESSAGE: skipped (stale)");
+      continue;
+    }
+
+    if (
+      request.hasSinceTimestamp &&
+      candidate.timestamp < request.sinceTimestamp
+    )
+    {
+      Serial.println("REQUEST_SYNC MESSAGE: skipped (before since cursor)");
+      continue;
+    }
+
+    bool present = gcsFilterMightContain(request, candidate.packetId);
+    Serial.print("GCS membership: ");
+    Serial.println(present ? "PRESENT" : "MISSING");
+    if (present)
+    {
+      continue;
+    }
+
+    if (!reserveRequestSyncResponse())
+    {
+      Serial.println("REQUEST_SYNC MESSAGE response: RATE LIMITED");
+      break;
+    }
+
+    missingMask |= 1 << i;
+  }
+
+  if (missingMask == 0)
+  {
+    Serial.println("REQUEST_SYNC MESSAGE response: not needed");
+    return;
+  }
+
+  if (!takeProtocolStateMutex())
+  {
+    Serial.println("REQUEST_SYNC MESSAGE: LOCK TIMEOUT");
+    return;
+  }
+
+  uint8_t queued = 0;
+  for (uint8_t i = 0; i < candidateCount; i++)
+  {
+    const Candidate& candidate = candidates[i];
+    // Skip a slot that was replaced by a newer message during evaluation.
+    if (
+      (missingMask & (1 << i)) == 0 ||
+      localMessages[candidate.slot].sequence != candidate.sequence
+    )
+    {
+      continue;
+    }
+
+    localMessageResponsePendingMask |= 1 << candidate.slot;
+    queued++;
+  }
+
+  xSemaphoreGive(protocolStateMutex);
+
+  Serial.print("REQUEST_SYNC MESSAGE response: ");
+  Serial.print(queued);
+  Serial.println(" RSR MESSAGE QUEUED");
+}
+
+void serviceLocalMessageResponses()
+{
+  if (!bitchatLinkReady)
+  {
+    return;
+  }
+
+  static uint8_t packet[MAX_LOCAL_MESSAGE_PACKET];
+  size_t packetLength = 0;
+
+  if (!takeProtocolStateMutex())
+  {
+    return;
+  }
+
+  for (uint8_t i = 0; i < LOCAL_MESSAGE_CACHE_SIZE; i++)
+  {
+    if ((localMessageResponsePendingMask & (1 << i)) == 0)
+    {
+      continue;
+    }
+
+    localMessageResponsePendingMask &= ~(1 << i);
+    if (localMessages[i].used)
+    {
+      packetLength = localMessages[i].packetLength;
+      memcpy(packet, localMessages[i].packet, packetLength);
+    }
+    break;
+  }
+
+  xSemaphoreGive(protocolStateMutex);
+
+  if (packetLength == 0)
+  {
+    return;
+  }
+
+  // TTL and RSR are mutable relay fields and are excluded from the signature.
+  packet[2] = 0;
+  packet[11] |= 0x10;
+
+  Serial.println();
+  Serial.println("=== REQUEST_SYNC MESSAGE RESPONSE TX ===");
+  Serial.print("Timestamp (ms): ");
+  printUInt64(readBE64(packet + 3));
+  Serial.println();
+  Serial.println("TTL: 0");
+  Serial.println("Flags: 0x12 [signature, RSR]");
+  transmitBitchatPacket(packet, packetLength);
+}
+
+// Each line typed in the serial monitor is sent as one public message. The
+// monitor must be configured to send a newline or carriage return.
+void serviceSerialInput()
+{
+  static uint8_t line[MAX_LOCAL_MESSAGE_BYTES];
+  static size_t lineLength = 0;
+  static bool lineOverflow = false;
+
+  while (Serial.available() > 0)
+  {
+    int value = Serial.read();
+    if (value < 0)
+    {
+      break;
+    }
+
+    if (value == '\r' || value == '\n')
+    {
+      if (lineOverflow)
+      {
+        Serial.print("Serial input: REJECTED (exceeds ");
+        Serial.print(MAX_LOCAL_MESSAGE_BYTES);
+        Serial.println(" bytes)");
+      }
+      else if (lineLength > 0)
+      {
+        if (isValidUtf8(line, lineLength))
+        {
+          sendLocalPublicMessage(line, lineLength);
+        }
+        else
+        {
+          Serial.println("Serial input: REJECTED (invalid UTF-8)");
+        }
+      }
+
+      lineLength = 0;
+      lineOverflow = false;
+      continue;
+    }
+
+    if (lineOverflow)
+    {
+      continue;
+    }
+
+    if (lineLength >= sizeof(line))
+    {
+      lineOverflow = true;
+      continue;
+    }
+
+    line[lineLength++] = (uint8_t)value;
+  }
 }
 
 bool parseAnnouncePayload(
@@ -2948,6 +3443,7 @@ void setup()
   Bluefruit.Scanner.useActiveScan(false);
 
   Serial.println("Scanning for Bitchat...");
+  Serial.println("Type a line and press Enter to send a public message.");
 
 #if FORCE_REQUEST_SYNC_MISSING_TEST
   Serial.println(
@@ -2961,7 +3457,9 @@ void setup()
 
 void loop()
 {
+  serviceSerialInput();
   serviceRequestSyncResponse();
+  serviceLocalMessageResponses();
   serviceLocalAnnounce();
 }
 
@@ -3123,8 +3621,9 @@ void connect_callback(uint16_t conn_handle)
 
   if (connection)
   {
+    bitchatLinkMtu = connection->getMtu();
     Serial.print("MTU after exchange: ");
-    Serial.println(connection->getMtu());
+    Serial.println(bitchatLinkMtu);
   }
 
   bitchatLinkReady = true;
@@ -3177,6 +3676,7 @@ void disconnect_callback(
 
   bitchatLinkReady = false;
   bitchatCharacteristicProperties = 0;
+  bitchatLinkMtu = 23;
   localAnnouncePending = false;
   requestSyncResponsePending = false;
   requestSyncResponseWindowStartedAt = 0;
@@ -3185,6 +3685,7 @@ void disconnect_callback(
   if (takeProtocolStateMutex())
   {
     secureZero(&verifiedPeer, sizeof(verifiedPeer));
+    localMessageResponsePendingMask = 0;
     xSemaphoreGive(protocolStateMutex);
   }
 

@@ -1,6 +1,7 @@
 #include "../../sketch_bitchat.ino"
 #include <cassert>
 #include <iostream>
+#include <algorithm>
 
 uint32_t g_millis = 1000;
 SerialStub Serial;
@@ -61,6 +62,55 @@ static int failures = 0;
 
 static Bytes msg(const Peer& p, uint64_t ts, const std::string& text, uint8_t ttl = 7, const uint8_t* rcpt = nullptr) {
   return signPacket(p, packet(0x02, ttl, ts, 0x02 | (rcpt ? 0x01 : 0), p.id, rcpt, Bytes(text.begin(), text.end()))); }
+
+
+static bool verifyLocal(const Bytes& pkt) {
+  // Independent canonical verification with the local signing key.
+  if (pkt.size() < 86) return false;
+  Bytes c(pkt.begin(), pkt.end() - 64); c[2] = 0; c[11] &= (0x01 | 0x04);
+  size_t buckets[] = {256, 512, 1024, 2048};
+  for (size_t b : buckets) if (c.size() + 16 <= b) { size_t pad = b - c.size(); if (pad <= 255) c.insert(c.end(), pad, (uint8_t)pad); break; }
+  EVP_PKEY* k = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, nullptr, localIdentity.signingPublicKey, 32);
+  EVP_MD_CTX* x = EVP_MD_CTX_new(); EVP_DigestVerifyInit(x, nullptr, nullptr, nullptr, k);
+  int r = EVP_DigestVerify(x, pkt.data() + pkt.size() - 64, 64, c.data(), c.size());
+  EVP_MD_CTX_free(x); EVP_PKEY_free(k); return r == 1; }
+
+// Reassembles the fragments written by the XIAO, checking each frame.
+static bool reassembleWrites(const std::vector<Bytes>& writes, Bytes& outPkt, uint8_t expectTtl, uint8_t expectFlags) {
+  if (writes.empty()) return false;
+  uint16_t total = 0; Bytes id;
+  for (size_t i = 0; i < writes.size(); i++) {
+    const Bytes& w = writes[i];
+    if (w.size() > 244 || w[0] != 1 || w[1] != 0x20 || w[2] != expectTtl || w[11] != expectFlags) return false;
+    if (readBE16(&w[12]) + 22u != w.size() || memcmp(&w[14], localIdentity.senderId, 8) != 0) return false;
+    Bytes fid(w.begin() + 22, w.begin() + 30);
+    if (i == 0) { id = fid; total = readBE16(&w[32]); } else if (fid != id || readBE16(&w[32]) != total) return false;
+    if (readBE16(&w[30]) != i || w[34] != 0x02) return false;
+    outPkt.insert(outPkt.end(), w.begin() + 35, w.end());
+  }
+  return total == writes.size(); }
+
+static void tlv16(Bytes& b, uint8_t t, const Bytes& v) { b.push_back(t); b.push_back(v.size() >> 8); b.push_back(v.size() & 0xFF); b.insert(b.end(), v.begin(), v.end()); }
+
+// Golomb-Rice set containing the given packet IDs, matching the firmware decoder.
+static Bytes gcsEncode(std::vector<Bytes> ids, uint8_t p, uint32_t m) {
+  std::vector<uint64_t> buckets;
+  for (auto& id : ids) { Bytes h = sha(id); uint64_t v = readBE64(h.data()) & 0x7FFFFFFFFFFFFFFFULL; v %= m; if (v == 0) v = 1; buckets.push_back(v); }
+  std::sort(buckets.begin(), buckets.end());
+  std::vector<int> bits; uint64_t prev = 0;
+  for (uint64_t b : buckets) { uint64_t d = b - prev - 1; prev = b; for (uint64_t q = d >> p; q > 0; q--) bits.push_back(1); bits.push_back(0);
+    for (int i = p - 1; i >= 0; i--) bits.push_back((d >> i) & 1); }
+  Bytes out((bits.size() + 7) / 8, 0);
+  for (size_t i = 0; i < bits.size(); i++) if (bits[i]) out[i / 8] |= 0x80 >> (i % 8);
+  return out; }
+
+static Bytes requestSync(const Peer& p, uint64_t ts, const Bytes& gcs, uint16_t types, const uint64_t* since = nullptr) {
+  Bytes pl; tlv16(pl, 1, Bytes{7}); tlv16(pl, 2, Bytes{0, 0, 0x10, 0}); tlv16(pl, 3, gcs);
+  tlv16(pl, 4, Bytes{(uint8_t)types, (uint8_t)(types >> 8)});
+  if (since) { Bytes v; be64(v, *since); tlv16(pl, 5, v); }
+  return signPacket(p, packet(0x21, 0, ts, 0x03, p.id, localIdentity.senderId, pl)); }
+
+static std::string typeLine(const std::string& line) { Serial.out.clear(); Serial.in = line; serviceSerialInput(); return Serial.out; }
 
 int main() {
   setup();
@@ -159,7 +209,107 @@ int main() {
   out = "";
   CHECK(idOk && memcmp(sha(idIn).data(), id, 16) == 0, "local ANNOUNCE packet ID unchanged by refactor");
 
+
+  // ---- Local public message transmission ----
+  bitchatChar.writes.clear();
+  out = typeLine("hello iphone\n");
+  CHECK(bitchatChar.writes.size() == 1 && has(out, "Local MESSAGE signature self-check: VALID")
+        && has(out, "Content: hello iphone\n"), "short message sent in one write");
+  Bytes sent = bitchatChar.writes.empty() ? Bytes() : bitchatChar.writes[0];
+  const std::string shortText = "hello iphone";
+  Bytes expectedShort(shortText.begin(), shortText.end());
+  CHECK(sent.size() == 22 + 12 + 64 && sent[0] == 1 && sent[1] == 0x02 && sent[2] == 7 && sent[11] == 0x02
+        && memcmp(&sent[14], localIdentity.senderId, 8) == 0 && Bytes(sent.begin() + 22, sent.end() - 64) == expectedShort
+        && verifyLocal(sent), "short message wire format and signature");
+  uint64_t sentTs = sent.size() > 11 ? readBE64(&sent[3]) : 0;
+  uint64_t nowMs = 0; currentEpochMilliseconds(&nowMs);
+  CHECK(sentTs >= T0 && sentTs <= nowMs, "message timestamp from synchronized clock");
+
+  out = feed([&] { Bytes r = sent; r[2] = 6; return r; }());
+  CHECK(has(out, "self echo") && !has(out, "Content:"), "relayed copy of own message rejected");
+
+  bitchatChar.writes.clear();
+  std::string longOut; for (int i = 0; i < 30; i++) longOut += "送信テスト" + std::to_string(i) + " ";
+  out = typeLine(longOut + "\r\n");
+  Bytes rebuilt;
+  CHECK(bitchatChar.writes.size() > 1 && has(out, "Fragmentation: ") && reassembleWrites(bitchatChar.writes, rebuilt, 7, 0x00)
+        && rebuilt.size() == 22 + longOut.size() + 64 && Bytes(rebuilt.begin() + 22, rebuilt.end() - 64) == Bytes(longOut.begin(), longOut.end())
+        && verifyLocal(rebuilt), "long message fragmented and reassembles to a valid signed packet");
+
+  bitchatChar.writes.clear();
+  out = typeLine(std::string(MAX_LOCAL_MESSAGE_BYTES + 1, 'a') + "\n");
+  CHECK(has(out, "exceeds 1024 bytes") && bitchatChar.writes.empty(), "overlong input rejected");
+  out = typeLine(std::string(MAX_LOCAL_MESSAGE_BYTES, 'b') + "\n");
+  CHECK(bitchatChar.writes.size() > 1, "maximum-length input sent");
+  bitchatChar.writes.clear();
+  out = typeLine(std::string("bad \xC0\xAF\n"));
+  CHECK(has(out, "invalid UTF-8") && bitchatChar.writes.empty(), "invalid UTF-8 input rejected");
+  out = typeLine("\n\r\n");
+  CHECK(bitchatChar.writes.empty() && !has(out, "MESSAGE TX"), "empty lines ignored");
+  out = typeLine("partial");
+  CHECK(bitchatChar.writes.empty(), "line without terminator is buffered");
+  out = typeLine(" line\n");
+  CHECK(bitchatChar.writes.size() == 1 && has(out, "Content: partial line\n"), "buffered line completes");
+
+  // ---- REQUEST_SYNC for local messages ----
+  // Cache now holds the last four messages: long, max-length, "partial line" and the one before.
+  auto idOf = [](const Bytes& pkt) { Bytes in; in.push_back(pkt[1]); in.insert(in.end(), pkt.begin() + 14, pkt.begin() + 22);
+    in.insert(in.end(), pkt.begin() + 3, pkt.begin() + 11); in.insert(in.end(), pkt.begin() + 22, pkt.begin() + 22 + readBE16(&pkt[12]));
+    Bytes h = sha(in); return Bytes(h.begin(), h.begin() + 16); };
+  std::vector<Bytes> cachedIds;
+  for (int i = 0; i < LOCAL_MESSAGE_CACHE_SIZE; i++) {
+    Bytes pk(localMessages[i].packet, localMessages[i].packet + localMessages[i].packetLength);
+    cachedIds.push_back(idOf(pk));
+    if (memcmp(localMessages[i].packetId, cachedIds.back().data(), 16) != 0) cachedIds.back().clear();
+  }
+  out = "";
+  CHECK(std::all_of(cachedIds.begin(), cachedIds.end(), [](const Bytes& b) { return !b.empty(); }), "cached packet IDs match official definition");
+
+  g_millis += 31000;  // new response window
+  bitchatChar.writes.clear();
+  std::vector<Bytes> present(cachedIds.begin(), cachedIds.begin() + 3);
+  uint64_t reqTs = T0 + 20000;
+  out = feed(requestSync(peer, reqTs, gcsEncode(present, 7, 4096), 0x0002));
+  CHECK(count(out, "GCS membership: PRESENT") == 3 && count(out, "GCS membership: MISSING") == 1
+        && has(out, "1 RSR MESSAGE QUEUED") && has(out, "ANNOUNCE not requested"), "only missing message queued");
+  Serial.out.clear(); loop(); loop(); out = Serial.out;
+  Bytes rsr;
+  bool rsrOk = false;
+  // Ignore the periodic local ANNOUNCE that the loop may also send.
+  bitchatChar.writes.erase(std::remove_if(bitchatChar.writes.begin(), bitchatChar.writes.end(),
+    [](const Bytes& w) { return w[1] == 0x01; }), bitchatChar.writes.end());
+  if (bitchatChar.writes.size() == 1) { rsr = bitchatChar.writes[0]; rsrOk = rsr[2] == 0 && rsr[11] == 0x12 && verifyLocal(rsr); }
+  else if (reassembleWrites(bitchatChar.writes, rsr, 0, 0x10)) rsrOk = verifyLocal(rsr) && rsr[2] == 0 && rsr[11] == 0x12;
+  CHECK(rsrOk && has(out, "=== REQUEST_SYNC MESSAGE RESPONSE TX ===") && idOf(rsr) == cachedIds[3], "RSR message sent with TTL 0 and RSR flag");
+
+  g_millis += 31000;
+  bitchatChar.writes.clear();
+  out = feed(requestSync(peer, reqTs + 1, gcsEncode(cachedIds, 7, 4096), 0x0003));
+  Serial.out.clear(); loop(); loop();
+  CHECK(count(out, "GCS membership: PRESENT") >= 4 && has(out, "MESSAGE response: not needed") && bitchatChar.writes.size() <= 1,
+        "no message response when all are present");
+
+  g_millis += 31000;
+  bitchatChar.writes.clear();
+  uint64_t since = nowMs + 3600ULL * 1000;
+  out = feed(requestSync(peer, reqTs + 2, Bytes{0x00}, 0x0002, &since));
+  CHECK(count(out, "before since cursor") == 4 && has(out, "not needed"), "since cursor respected");
+
+  g_millis += 31000;
+  out = feed(requestSync(peer, reqTs + 3, Bytes{0x00}, 0x0002));
+  CHECK(has(out, "4 RSR MESSAGE QUEUED"), "all messages queued when filter is empty");
+  bitchatChar.writes.clear(); Serial.out.clear(); loop(); loop(); out = Serial.out;
+  std::vector<Bytes> rsrFragments;
+  for (auto& w : bitchatChar.writes) if (w[1] == 0x20) rsrFragments.push_back(w);
+  Bytes rsrLong;
+  CHECK(reassembleWrites(rsrFragments, rsrLong, 0, 0x10) && rsrLong[2] == 0 && rsrLong[11] == 0x12 && verifyLocal(rsrLong),
+        "fragmented RSR message keeps TTL 0 and RSR flag on fragments");
   disconnect_callback(0, 0x13);
+  bitchatChar.writes.clear(); Serial.out.clear(); loop(); out = Serial.out;
+  CHECK(bitchatChar.writes.empty() && localMessageResponsePendingMask == 0, "pending responses cleared on disconnect");
+  out = typeLine("offline\n");
+  CHECK(has(out, "no Bitchat link") && bitchatChar.writes.empty(), "send rejected while disconnected");
+
   out = feed(msg(peer, T0 + 10000, "after disconnect"));
   CHECK(has(out, "sender has no verified ANNOUNCE"), "peer cache cleared on disconnect");
 

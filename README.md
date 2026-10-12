@@ -12,13 +12,13 @@ The official iPhone app has displayed the XIAO as a peer, included its sender
 ID in a direct-neighbor announcement, and sent it authenticated
 `REQUEST_SYNC` packets. Signed, GCS-aware RSR announcement responses have also
 been transmitted successfully from the XIAO. Signed public messages from the
-verified peer are authenticated and displayed on the serial console; this path
-passes a host-side test harness and is awaiting on-device verification.
+verified peer are authenticated and displayed on the serial console, and lines
+typed in the serial monitor are sent as signed public messages. Both paths pass
+a host-side test harness and are awaiting on-device verification.
 
 > [!WARNING]
 > This is protocol research firmware, not a production Bitchat client. It does
-> not yet implement Noise sessions, private messaging, or message
-> transmission. Do not rely on it for
+> not yet implement Noise sessions or private messaging. Do not rely on it for
 > confidential or safety-critical communication.
 
 ## Current Status
@@ -38,6 +38,9 @@ passes a host-side test harness and is awaiting on-device verification.
 | Directed `REQUEST_SYNC` authentication and GCS decoding | Verified on hardware |
 | TTL-zero RSR announcement response | Verified with a 168-byte GATT write |
 | Public `MESSAGE` receive and display | Implemented; host tests pass, hardware test pending |
+| Public `MESSAGE` transmission from serial input | Implemented; host tests pass, hardware test pending |
+| Outbound fragmentation | Implemented; host tests pass, hardware test pending |
+| `REQUEST_SYNC` responses for local messages | Implemented; host tests pass, hardware test pending |
 | Noise XX and private messaging | Not implemented |
 
 See [the protocol and implementation status](docs/BITCHAT_PROTOCOL_STATUS.md)
@@ -114,6 +117,7 @@ BLE scan
   -> signed local announcement
   -> authenticated REQUEST_SYNC and RSR handling
   -> authenticated public MESSAGE display
+  -> signed public MESSAGE transmission from serial input
 ```
 
 Packet storage uses static buffers rather than heap allocation. Inbound and
@@ -147,6 +151,26 @@ Content: hello xiao
 Control characters and Unicode bidirectional formatting characters in peer
 text are printed as escapes such as `\x1B` or `\u{202E}`.
 
+## Sending Messages
+
+Set the serial monitor line ending to **Newline** (or **Both NL & CR**), wait
+for the peer announcement to be verified, then type a line and press Enter.
+The line is signed and broadcast as a public message from `xiao52840`:
+
+```text
+Local MESSAGE signature self-check: VALID
+
+=== LOCAL PUBLIC MESSAGE TX ===
+Sender: xiao52840
+...
+Content: hello iphone
+GATT write: OK (98 bytes)
+```
+
+Lines can be up to 1024 bytes of UTF-8. Packets that exceed one ATT write are
+sent as Bitchat fragments. The last four messages are kept in RAM and re-sent
+when the iPhone's sync request shows that it is missing them.
+
 ## Immediate Development Goal
 
 Public-message reception is implemented and passes the host test harness. The
@@ -156,10 +180,11 @@ remaining milestone work requires hardware:
    byte by byte.
 2. Verify ASCII, Japanese, emoji, invalid-signature, duplicate, stale, and
    fragmented long-message cases on the XIAO.
-3. Record the serial evidence in the protocol status document.
+3. Confirm that typed messages, including fragmented long lines, appear in
+   the iPhone public chat, and that sync restores them after an app restart.
+4. Record the serial evidence in the protocol status document.
 
-Noise, private messages, public-message transmission, and the BLE peripheral
-role are intentionally deferred until public receive passes this test matrix.
+Noise, private messages, and the BLE peripheral role remain deferred.
 
 ## Configuration
 
@@ -185,6 +210,8 @@ Set it to `1` only for a one-shot RSR response-path test, then return it to
 - Only one fragment assembly and one active-link verified peer are retained.
   Public messages from peers that have not announced on the active link are
   rejected.
+- Sent messages are kept only in RAM, so they cannot be re-served after a
+  reboot.
 - Public messages whose unsigned packet exceeds 2048 bytes (a payload above
   2026 bytes) are rejected because their signature cannot be verified.
 - Version 2 parsing is partial and has not been fully exercised.

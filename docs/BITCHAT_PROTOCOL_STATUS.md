@@ -26,8 +26,15 @@ Public `MESSAGE` reception is now implemented: signed messages from the
 active-link verified peer are authenticated, checked for freshness and
 duplicates, validated as UTF-8, and displayed on the serial console. The
 acceptance matrix passes in a host test harness; live capture and on-device
-verification are still pending. The BLE peripheral role, the Noise XX
-handshake, and message transmission have not been implemented yet.
+verification are still pending.
+
+Public `MESSAGE` transmission is also implemented. Each line typed in the
+serial monitor is signed and written to the iPhone, with outbound
+fragmentation when the packet exceeds one ATT write. The last four sent
+messages are retained and re-served as TTL-zero RSR responses when a
+`REQUEST_SYNC` filter lacks them. This path also passes the host harness and
+awaits a hardware test. The BLE peripheral role, the Noise XX handshake, and
+private messaging have not been implemented yet.
 
 ## Current Data Flow
 
@@ -54,6 +61,11 @@ flowchart LR
     R --> S[Verified sender, freshness, and duplicate checks]
     S --> T[Ed25519 verification and UTF-8 validation]
     T --> U[Serial display]
+    V[Serial monitor line] --> W[Sign local public MESSAGE]
+    W --> X[Local MESSAGE cache]
+    W --> Y[Outbound fragmentation and GATT write]
+    P --> Z[Queued TTL 0 RSR MESSAGE responses]
+    X --> Z
 ```
 
 The implementation uses static buffers and does not allocate packet storage on
@@ -553,7 +565,10 @@ use the actual GCS membership result.
 | Public MESSAGE duplicate suppression | Implemented | 64-entry ring of authenticated 16-byte packet IDs |
 | BLE peripheral role | Not implemented | Not required for the first central-role transmission test |
 | Noise XX handshake | Not implemented | Required for authenticated private communication |
-| Message transmission | Not implemented | Depends on peer presence and Noise work |
+| Public MESSAGE transmission | Implemented; hardware test pending | Serial-line input, signed version 1 packet, TTL 7 |
+| Outbound fragmentation | Implemented; hardware test pending | Version 1 FRAGMENT packets sized to the negotiated MTU |
+| REQUEST_SYNC MESSAGE responses | Implemented; hardware test pending | Last four local messages, GCS, six-hour, and since-cursor checks |
+| Private message transmission | Not implemented | Depends on Noise work |
 
 ## Resource Limits and Trade-offs
 
@@ -568,13 +583,17 @@ MAX_ANNOUNCE_PACKET = 256
 MAX_REQUEST_SYNC_GCS = 1024
 MAX_NICKNAME_BYTES = 255
 SEEN_PUBLIC_MESSAGE_RING_SIZE = 64
+MAX_LOCAL_MESSAGE_BYTES = 1024
+LOCAL_MESSAGE_CACHE_SIZE = 4
 ```
 
 The current fragment storage reserves approximately 7.7 KiB, and the signing
 verification buffer reserves 2 KiB. This is acceptable on the XIAO nRF52840,
 but a multi-peer assembly table should allocate entries deliberately rather
 than multiplying the current structure without a memory budget. The public
-message duplicate ring reserves 1 KiB.
+message duplicate ring reserves 1 KiB. The local message cache reserves about
+4.5 KiB, and the outbound message, fragment, and serial-line buffers reserve
+about 3.7 KiB more.
 
 Because the canonical signing representation is limited to
 `MAX_SIGNING_DATA`, a public message is accepted only when its unsigned
@@ -617,11 +636,14 @@ Arduino loop. Lock acquisition has a one-second timeout and fails closed.
   the installed LittleFS and internal-filesystem headers.
 - First-boot creation and reboot loading of the identity record have not yet
   been confirmed on the XIAO hardware.
-- The public `MESSAGE` path passes 22 host-side test cases (see
+- The public `MESSAGE` receive and transmit paths pass 43 host-side test
+  cases. The receive path is covered by 22 of them (see
   [Host Test Harness](#host-test-harness)), including signed ASCII, Japanese
   and emoji text, duplicate suppression, invalid and missing signatures,
   spoofed sender IDs, stale messages, fragmented long text, invalid UTF-8,
-  and terminal-control escaping.
+  and terminal-control escaping. The remaining cases cover transmitted wire
+  format and signatures, fragmentation and reassembly, serial-input limits,
+  GCS-driven RSR message responses, the since cursor, and disconnect cleanup.
 - The source passes `git diff --check`.
 - The sketch passes a C++11 syntax check with the XIAO nRF52840 ARM compiler.
 - Object generation with the XIAO toolchain succeeded.
@@ -639,11 +661,12 @@ object checks.
 
 ## Immediate Milestone: Public MESSAGE Receive and Display
 
-The current implementation target is deliberately limited to displaying a
-signed public `MESSAGE` (`0x02`) from the iPhone on the XIAO serial console.
-Public transmission, the BLE peripheral role, Noise, private messages,
-group-message decryption, and media are out of scope until this milestone
-passes.
+The current implementation target is displaying a signed public `MESSAGE`
+(`0x02`) from the iPhone on the XIAO serial console. Public transmission was
+implemented afterward, ahead of the hardware test matrix, and is described in
+[Public MESSAGE Transmission](#public-message-transmission). The BLE
+peripheral role, Noise, private messages, group-message decryption, and media
+remain out of scope.
 
 | Phase | Status |
 | --- | --- |
@@ -776,7 +799,10 @@ the verified peer cache on disconnect.
 machine against stub Arduino, Bluefruit, FreeRTOS, and LittleFS headers. The
 CryptoCell SHA-256, Ed25519, and X25519 calls are implemented with OpenSSL. The
 test signs packets with an independent implementation of the canonical
-signing representation and feeds them through `parse_bitchat_packet()`.
+signing representation and feeds them through `parse_bitchat_packet()`. For
+transmission, it feeds serial input, captures the GATT writes, reassembles any
+fragments independently, and verifies the signature with the local public
+key.
 
 ```sh
 tests/host/run.sh
@@ -786,17 +812,109 @@ The script requires a C++17 compiler and the OpenSSL 3 development headers.
 The harness exercises protocol logic only; BLE timing, CryptoCell behavior,
 and serial throughput must still be verified on the XIAO.
 
-## Deferred Work After Public Receive
+## Public MESSAGE Transmission
 
-1. Encode, sign, and transmit a public `MESSAGE` from the XIAO.
-2. Persist or bound a multi-peer verified registry and replace the single
+### Input
+
+Each line typed in the serial monitor is sent as one public message. The
+monitor must send a newline, carriage return, or both. Lines are limited to
+1024 bytes and must be valid UTF-8; longer or invalid lines are rejected
+without being sent. Sending requires an active link, a ready local identity,
+and the clock synchronized from a verified announcement.
+
+### Packet
+
+The packet mirrors upstream `BLEService.sendMessage` for a public broadcast:
+
+| Field | Value |
+| --- | --- |
+| Version | `1` |
+| Type | `MESSAGE` (`0x02`) |
+| TTL | `7` (`messageTTLDefault`) |
+| Timestamp | Synchronized epoch milliseconds |
+| Flags | `0x02` (signature) |
+| Recipient | None (broadcast) |
+| Payload | UTF-8 text bytes |
+| Signature | Ed25519 over the canonical signing representation |
+
+Public packets are written unpadded; upstream pads Noise frames only, and its
+decoder accepts unpadded packets before trying padding removal. The signature
+passes an on-device self-check before transmission, using the same signing
+function as the local announcement.
+
+Expected log:
+
+```text
+Local MESSAGE signature self-check: VALID
+
+=== LOCAL PUBLIC MESSAGE TX ===
+Sender: xiao52840
+Sender ID: ...
+Timestamp (ms): ... (2026-...Z)
+Packet ID: ...
+Length: 12 bytes
+Packet length: 98
+Content: hello iphone
+GATT write: OK (98 bytes)
+```
+
+### Outbound Fragmentation
+
+Bluefruit splits an oversized write-without-response into raw ATT-sized
+chunks, which a Bitchat receiver cannot parse. Any packet larger than
+`MTU - 3` bytes is therefore split into version 1 `FRAGMENT` packets that
+follow the upstream fragment planner:
+
+- a random 8-byte fragment ID from CryptoCell;
+- the original TTL, timestamp, sender ID, and RSR flag on every fragment;
+- no signature on the fragments, because the reassembled inner packet carries
+  the signature;
+- chunk size `MTU - 3 - 35`, which is 209 bytes at MTU 247;
+- at most 16 fragments, matching the local reassembly limit;
+- 30 ms spacing between fragment writes (`bleFragmentSpacingMs`).
+
+A 1024-byte message produces a 1110-byte packet and six fragments at MTU 247.
+
+### Sync Responses
+
+The last four transmitted messages are kept in RAM. When a verified
+`REQUEST_SYNC` requests the `message` type, each cached message is checked in
+order:
+
+1. Skip it when it is older than six hours.
+2. Skip it when it is older than the request's since cursor.
+3. Skip it when the GCS filter already contains its packet ID.
+4. Otherwise reserve one response from the shared eight-per-30-seconds
+   budget and queue it.
+
+The Arduino loop sends one queued message per iteration with TTL 0 and the
+RSR flag, fragmenting it when needed. Pending responses are cleared on
+disconnect. The cache itself survives reconnects but not a reboot.
+
+The XIAO still rejects every packet carrying its own sender ID. It never sends
+`REQUEST_SYNC`, so no self-authored copy is solicited, and its own messages are
+already shown in the transmission log.
+
+### Hardware Test Plan
+
+| Case | Expected result |
+| --- | --- |
+| Short ASCII line | Shown in the iPhone public chat as `xiao52840` |
+| Japanese text and emoji | Shown without UTF-8 corruption |
+| Line longer than 158 bytes | Sent as fragments and shown once |
+| 1024-byte line | Six fragments, shown once |
+| iPhone app restarted or reconnected | Missing recent messages restored through RSR responses |
+| Relayed copy of own message | Rejected as self echo on the XIAO |
+
+## Deferred Work
+
+1. Persist or bound a multi-peer verified registry and replace the single
    fragment assembly with a sender-ID/fragment-ID keyed table.
-3. Define an explicit local-identity reset and backup policy.
-4. Enable the BLE peripheral role for full dual-role mesh participation.
-5. Add outbound fragmentation for packets larger than the active link MTU.
-6. Implement `Noise_XX_25519_ChaChaPoly_SHA256`, bind the authenticated static
+2. Define an explicit local-identity reset and backup policy.
+3. Enable the BLE peripheral role for full dual-role mesh participation.
+4. Implement `Noise_XX_25519_ChaChaPoly_SHA256`, bind the authenticated static
    key to the announcement identity, and receive private messages.
-7. Add private-message transmission, receipts, group sessions, and media in
+5. Add private-message transmission, receipts, group sessions, and media in
    later milestones.
 
 ## Upstream References

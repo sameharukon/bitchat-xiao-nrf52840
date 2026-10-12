@@ -16,7 +16,10 @@ inline void delay(uint32_t ms) { g_millis += ms; }
 
 struct SerialStub {
   std::string out;
+  std::string in;
   explicit operator bool() const { return true; }
+  int available() { return (int)in.size(); }
+  int read() { if (in.empty()) return -1; int c = (uint8_t)in[0]; in.erase(0, 1); return c; }
   void begin(int) {}
   size_t write(uint8_t c) { out.push_back((char)c); return 1; }
   size_t write(const uint8_t* d, size_t n) { out.append((const char*)d, n); return n; }
